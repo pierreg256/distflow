@@ -198,7 +198,7 @@ export class PMDClient {
   /**
    * Resolve alias to node info
    */
-  async resolve(alias: string): Promise<any> {
+  async resolve(alias: string): Promise<NodeInfo> {
     const response = await this.sendMessage(MessageType.RESOLVE, { alias });
 
     if (response.error) {
@@ -211,7 +211,7 @@ export class PMDClient {
   /**
    * List all registered nodes
    */
-  async list(): Promise<any[]> {
+  async list(): Promise<NodeInfo[]> {
     const response = await this.sendMessage(MessageType.LIST, {});
     return response.nodes || [];
   }

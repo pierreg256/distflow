@@ -3,9 +3,10 @@ import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as child_process from 'child_process';
+import * as net from 'net';
 import { EventEmitter } from 'events';
 import { Mailbox, MailboxConfig, MessageMetadata } from './mailbox';
-import { PMDClient } from './pmd-client';
+import { PMDClient, NodeInfo } from './pmd-client';
 import { Transport } from './transport';
 
 /**
@@ -144,7 +145,7 @@ export class NodeRuntime extends EventEmitter {
    */
   private async ensurePMDRunning(port: number): Promise<void> {
     // Try to connect to existing PMD
-    const testSocket = require('net').createConnection({ host: 'localhost', port });
+    const testSocket = net.createConnection({ host: 'localhost', port });
     
     return new Promise((resolve, reject) => {
       testSocket.on('connect', () => {
@@ -242,7 +243,7 @@ export class NodeRuntime extends EventEmitter {
     }
 
     // Resolve target (could be alias or nodeId)
-    let nodeInfo: any;
+    let nodeInfo: NodeInfo;
     
     try {
       nodeInfo = await this.pmdClient.resolve(target);
