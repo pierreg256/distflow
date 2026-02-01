@@ -1,0 +1,26 @@
+{
+  "name": "@distflow/core",
+  "version": "0.1.0",
+  "description": "Core library for distflow distributed framework",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": [
+    "distributed",
+    "messaging",
+    "tcp"
+  ],
+  "author": "pierreg256",
+  "license": "MIT",
+  "dependencies": {
+    "@distflow/pmd": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@distflow/pmd",
+  "version": "0.1.0",
+  "description": "Port Mapper Daemon for distflow",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": [
+    "pmd",
+    "port-mapper",
+    "daemon"
+  ],
+  "author": "pierreg256",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0"
+  }
+}
