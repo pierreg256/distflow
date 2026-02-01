@@ -1,0 +1,13 @@
+{
+  "name": "ping-pong-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Simple ping-pong example",
+  "scripts": {
+    "start:pong": "node pong.js",
+    "start:ping": "node ping.js"
+  },
+  "dependencies": {
+    "@distflow/core": "^0.1.0"
+  }
+}

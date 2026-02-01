@@ -1,0 +1,26 @@
+{
+  "name": "@distflow/cli",
+  "version": "0.1.0",
+  "description": "CLI tools for distflow",
+  "bin": {
+    "distflow": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": [
+    "cli",
+    "distflow"
+  ],
+  "author": "pierreg256",
+  "license": "MIT",
+  "dependencies": {
+    "@distflow/pmd": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0"
+  }
+}
