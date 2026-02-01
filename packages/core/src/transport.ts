@@ -1,5 +1,4 @@
 import * as net from 'net';
-import * as crypto from 'crypto';
 import { MessageMetadata } from './mailbox';
 
 /**

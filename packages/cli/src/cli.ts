@@ -1,7 +1,29 @@
 #!/usr/bin/env node
 
 import * as net from 'net';
-import { Message, MessageType } from '@distflow/pmd';
+
+/**
+ * PMD protocol message types
+ */
+enum MessageType {
+  REGISTER = 'register',
+  UNREGISTER = 'unregister',
+  RESOLVE = 'resolve',
+  LIST = 'list',
+  HEARTBEAT = 'heartbeat',
+  WATCH = 'watch',
+  RESPONSE = 'response',
+  EVENT = 'event'
+}
+
+/**
+ * Base message structure
+ */
+interface Message {
+  type: MessageType;
+  payload: any;
+  requestId?: string;
+}
 
 /**
  * PMD CLI Client
@@ -162,7 +184,7 @@ async function pmdResolve(alias: string, port: number): Promise<void> {
   }
 }
 
-async function pmdKill(port: number): Promise<void> {
+async function pmdKill(_port: number): Promise<void> {
   console.log('Kill command not implemented yet');
   console.log('Please manually stop the PMD process');
 }
