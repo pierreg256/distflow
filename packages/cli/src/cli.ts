@@ -12,6 +12,7 @@ enum MessageType {
   LIST = 'list',
   HEARTBEAT = 'heartbeat',
   WATCH = 'watch',
+  SHUTDOWN = 'shutdown',
   RESPONSE = 'response',
   EVENT = 'event'
 }
@@ -184,9 +185,20 @@ async function pmdResolve(alias: string, port: number): Promise<void> {
   }
 }
 
-async function pmdKill(_port: number): Promise<void> {
-  console.log('Kill command not implemented yet');
-  console.log('Please manually stop the PMD process');
+async function pmdKill(port: number): Promise<void> {
+  try {
+    const client = new PMDCLIClient();
+    await client.connect('localhost', port);
+    
+    await client.sendRequest(MessageType.SHUTDOWN, {});
+    
+    console.log('PMD shutdown command sent successfully');
+    
+    client.disconnect();
+  } catch (err) {
+    console.error('Failed to shutdown PMD:', err);
+    process.exit(1);
+  }
 }
 
 function showHelp(): void {

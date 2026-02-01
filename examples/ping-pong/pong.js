@@ -4,7 +4,7 @@ async function main() {
   // Start node with alias 'pong'
   const node = await NodeRuntime.start({
     alias: 'pong',
-    pmdPort: 4369
+    //pmdPort: 4369
   });
 
   console.log('Pong node started');
@@ -13,7 +13,7 @@ async function main() {
 
   // Listen for messages
   node.onMessage((message, meta) => {
-    console.log(`Received from ${meta.from}:`, message);
+    console.log(`Received from ${meta.alias} ${meta.from}:`, message);
 
     if (message.type === 'PING') {
       // Reply with PONG

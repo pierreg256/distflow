@@ -1,0 +1,18 @@
+{
+  "name": "distflow-example-ring",
+  "version": "0.1.0",
+  "description": "Ring topology example with dynamic node management",
+  "scripts": {
+    "start": "node node.js"
+  },
+  "keywords": [
+    "distflow",
+    "ring",
+    "distributed"
+  ],
+  "author": "pierreg256",
+  "license": "MIT",
+  "dependencies": {
+    "@distflow/core": "^0.1.0"
+  }
+}

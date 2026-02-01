@@ -170,24 +170,35 @@ export class NodeRuntime extends EventEmitter {
    * Start PMD daemon
    */
   private async startPMD(port: number): Promise<void> {
-    // Path to PMD executable
-    const pmdPath = path.join(__dirname, '../../pmd/dist/index.js');
+    // Try to find PMD cli.js in multiple locations
+    const possiblePaths = [
+      path.join(__dirname, '../../pmd/dist/cli.js'),  // Monorepo workspace
+      path.join(__dirname, '../../../@distflow/pmd/dist/cli.js'),  // node_modules
+      require.resolve('@distflow/pmd/dist/cli.js')  // Try to resolve from node_modules
+    ];
 
-    // Check if PMD exists
-    if (!fs.existsSync(pmdPath)) {
-      throw new Error(`PMD not found at ${pmdPath}. Please build @distflow/pmd first.`);
+    let pmdPath: string | undefined;
+    for (const p of possiblePaths) {
+      if (fs.existsSync(p)) {
+        pmdPath = p;
+        break;
+      }
+    }
+
+    if (!pmdPath) {
+      throw new Error(`PMD cli.js not found. Tried: ${possiblePaths.join(', ')}. Please build @distflow/pmd first.`);
     }
 
     // Start PMD as child process
     this.pmdProcess = child_process.spawn('node', [pmdPath, '--port', port.toString()], {
       detached: true,
-      stdio: 'ignore'
+      stdio: ['ignore', 'ignore', 'ignore']
     });
 
     this.pmdProcess.unref();
 
     // Wait for PMD to be ready
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 
   /**
@@ -217,7 +228,7 @@ export class NodeRuntime extends EventEmitter {
       } catch (err) {
         console.error('Heartbeat failed:', err);
       }
-    }, 30000); // Every 30 seconds
+    }, 1000); // Every 1 second (1/3 of PMD TTL for safety margin)
   }
 
   /**

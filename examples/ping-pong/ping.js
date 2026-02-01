@@ -4,7 +4,7 @@ async function main() {
   // Start node with alias 'ping'
   const node = await NodeRuntime.start({
     alias: 'ping',
-    pmdPort: 4369
+    //pmdPort: 4369
   });
 
   console.log('Ping node started');

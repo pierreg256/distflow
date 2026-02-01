@@ -9,6 +9,7 @@ export interface PMDOptions {
   port: number;
   ttl?: number; // Time-to-live in milliseconds
   cleanupInterval?: number; // Cleanup check interval
+  autoShutdownDelay?: number; // Auto-shutdown delay when no nodes (milliseconds)
 }
 
 /**
@@ -21,13 +22,15 @@ export class PMD extends EventEmitter {
   private watchers: Set<net.Socket> = new Set();
   private options: Required<PMDOptions>;
   private cleanupTimer?: NodeJS.Timeout;
+  private autoShutdownTimer?: NodeJS.Timeout;
 
   constructor(options: PMDOptions) {
     super();
     this.options = {
       port: options.port,
-      ttl: options.ttl ?? 60000, // 60 seconds default
-      cleanupInterval: options.cleanupInterval ?? 10000 // 10 seconds default
+      ttl: options.ttl ?? 3000, // 3 seconds default
+      cleanupInterval: options.cleanupInterval ?? 500, // 500ms default
+      autoShutdownDelay: options.autoShutdownDelay ?? 30000 // 30 seconds default
     };
 
     this.server = net.createServer((socket) => this.handleConnection(socket));
@@ -56,6 +59,10 @@ export class PMD extends EventEmitter {
   async stop(): Promise<void> {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
+    }
+
+    if (this.autoShutdownTimer) {
+      clearTimeout(this.autoShutdownTimer);
     }
 
     return new Promise((resolve) => {
@@ -127,6 +134,9 @@ export class PMD extends EventEmitter {
       case MessageType.WATCH:
         this.handleWatch(socket, message);
         break;
+      case MessageType.SHUTDOWN:
+        this.handleShutdown(socket, message);
+        break;
       default:
         this.sendResponse(socket, message.requestId, { error: 'Unknown message type' });
     }
@@ -164,6 +174,9 @@ export class PMD extends EventEmitter {
       this.aliasMap.set(payload.alias, payload.nodeId);
     }
 
+    // Cancel auto-shutdown if a node registers
+    this.cancelAutoShutdown();
+
     this.sendResponse(socket, message.requestId, { success: true });
 
     // Notify watchers of new peer
@@ -196,6 +209,9 @@ export class PMD extends EventEmitter {
         event: 'peer:leave',
         peer: nodeInfo
       });
+
+      // Check if registry is empty and schedule auto-shutdown
+      this.checkAutoShutdown();
     } else {
       this.sendResponse(socket, message.requestId, { error: 'Node not found' });
     }
@@ -206,13 +222,20 @@ export class PMD extends EventEmitter {
    */
   private handleResolve(socket: net.Socket, message: Message): void {
     const { alias } = message.payload;
-    const nodeId = this.aliasMap.get(alias);
+    
+    // First try to resolve as alias
+    let nodeId = this.aliasMap.get(alias);
+    
+    // If not found, check if it's a nodeId directly
+    if (!nodeId && this.registry.has(alias)) {
+      nodeId = alias;
+    }
 
     if (nodeId) {
       const nodeInfo = this.registry.get(nodeId);
       this.sendResponse(socket, message.requestId, { node: nodeInfo });
     } else {
-      this.sendResponse(socket, message.requestId, { error: 'Alias not found' });
+      this.sendResponse(socket, message.requestId, { error: 'Node not found' });
     }
   }
 
@@ -245,6 +268,21 @@ export class PMD extends EventEmitter {
   private handleWatch(socket: net.Socket, message: Message): void {
     this.watchers.add(socket);
     this.sendResponse(socket, message.requestId, { success: true });
+  }
+
+  /**
+   * Handle shutdown request
+   */
+  private handleShutdown(socket: net.Socket, message: Message): void {
+    this.sendResponse(socket, message.requestId, { success: true });
+    
+    // Give time for response to be sent before shutting down
+    setTimeout(() => {
+      console.log('Shutdown requested, stopping PMD...');
+      this.stop().then(() => {
+        process.exit(0);
+      });
+    }, 100);
   }
 
   /**
@@ -309,7 +347,36 @@ export class PMD extends EventEmitter {
           });
         }
       }
+
+      // Check if registry is empty and schedule auto-shutdown
+      this.checkAutoShutdown();
     }, this.options.cleanupInterval);
+  }
+
+  /**
+   * Check if auto-shutdown should be triggered
+   */
+  private checkAutoShutdown(): void {
+    if (this.registry.size === 0 && !this.autoShutdownTimer) {
+      console.log(`No nodes registered. PMD will auto-shutdown in ${this.options.autoShutdownDelay / 1000} seconds...`);
+      this.autoShutdownTimer = setTimeout(() => {
+        console.log('Auto-shutdown triggered (no nodes for 30 seconds)');
+        this.stop().then(() => {
+          process.exit(0);
+        });
+      }, this.options.autoShutdownDelay);
+    }
+  }
+
+  /**
+   * Cancel auto-shutdown timer
+   */
+  private cancelAutoShutdown(): void {
+    if (this.autoShutdownTimer) {
+      console.log('Auto-shutdown cancelled (node registered)');
+      clearTimeout(this.autoShutdownTimer);
+      this.autoShutdownTimer = undefined;
+    }
   }
 
   /**

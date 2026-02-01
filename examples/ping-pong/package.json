@@ -4,6 +4,7 @@
   "private": true,
   "description": "Simple ping-pong example",
   "scripts": {
+    "build": "echo \"No build needed for JS example\"",
     "start:pong": "node pong.js",
     "start:ping": "node ping.js"
   },

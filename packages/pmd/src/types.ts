@@ -19,6 +19,7 @@ export enum MessageType {
   LIST = 'list',
   HEARTBEAT = 'heartbeat',
   WATCH = 'watch',
+  SHUTDOWN = 'shutdown',
   RESPONSE = 'response',
   EVENT = 'event'
 }

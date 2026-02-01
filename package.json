@@ -4,7 +4,8 @@
   "private": true,
   "description": "Framework TypeScript pour le développement distribué (PMD + messaging)",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "examples/*"
   ],
   "scripts": {
     "build": "npm run build --workspaces",
