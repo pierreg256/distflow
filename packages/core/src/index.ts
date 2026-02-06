@@ -1,3 +1,4 @@
 export { NodeRuntime, NodeRuntimeOptions, PeerInfo } from './node-runtime';
 export { Mailbox, MailboxConfig, MessageMetadata } from './mailbox';
 export { NodeInfo } from './pmd-client';
+export { JSONCrdt, Op, JsonValue, Path, VectorClock, ReplicaId } from './json-crdt';

@@ -1,15 +1,26 @@
-const { NodeRuntime } = require('@distflow/core');
+const { NodeRuntime, JSONCrdt } = require('@distflow/core');
+const crypto = require('crypto');
 
 /**
- * Ring Node - maintains a ring topology with dynamic membership
+ * Compute consistent hash for a node identifier
+ * Uses SHA-256 and returns first 8 bytes as a number
+ */
+function consistentHash(nodeId) {
+  const hash = crypto.createHash('sha256').update(nodeId).digest();
+  // Use first 8 bytes as a 64-bit number (well, 53-bit safe integer in JS)
+  return hash.readUInt32BE(0) * 0x100000000 + hash.readUInt32BE(4);
+}
+
+/**
+ * Ring Node - maintains a ring topology with dynamic membership using CRDT
+ * Nodes are ordered by consistent hash of their nodeId
  */
 class RingNode {
   constructor(alias) {
     this.alias = alias;
     this.node = null;
-    this.ring = []; // Sorted list of all nodes in the ring
-    this.successor = null;
-    this.predecessor = null;
+    this.crdt = null; // CRDT for distributed ring state
+    this.syncInterval = null;
   }
 
   async start() {
@@ -24,15 +35,25 @@ class RingNode {
       }
     });
 
+    // Initialize CRDT with this node's ID
+    this.crdt = new JSONCrdt(this.node.getNodeId(), {
+      members: {},
+      token: null
+    });
+
+    // Add self to the ring
+    this.addSelfToRing();
+
     // Listen for peer join/leave events
     this.node.on('peer:join', async (peer) => {
       console.log(`[${this.alias}] Peer joined: ${peer.alias || peer.nodeId}`);
-      await this.updateRing();
+      // No immediate action - will be added via CRDT sync
     });
 
     this.node.on('peer:leave', async (peer) => {
       console.log(`[${this.alias}] Peer left: ${peer.alias || peer.nodeId}`);
-      await this.updateRing();
+      // Remove from CRDT
+      this.removeMemberFromRing(peer.nodeId);
     });
 
     // Listen for messages
@@ -40,8 +61,8 @@ class RingNode {
       this.handleMessage(message, meta);
     });
 
-    // Initial ring update
-    await this.updateRing();
+    // Start periodic CRDT sync
+    this.startCrdtSync();
 
     // Periodically display ring structure
     setInterval(() => {
@@ -50,78 +71,118 @@ class RingNode {
   }
 
   /**
-   * Update the ring structure based on current peers
+   * Add self to the CRDT ring state
    */
-  async updateRing() {
-    try {
-      const peers = await this.node.discover();
-      
-      // Include self in the ring
-      const allNodes = [
-        { alias: this.alias, nodeId: this.node.getNodeId() },
-        ...peers
-      ];
+  addSelfToRing() {
+    const state = this.crdt.value();
+    const members = state.members || {};
 
-      // Filter out nodes without alias (keep only ring nodes)
-      const ringNodes = allNodes.filter(n => n.alias && n.alias.startsWith('ring-'));
+    this.crdt.set(['members', this.node.getNodeId()], {
+      alias: this.alias,
+      nodeId: this.node.getNodeId(),
+      joinedAt: Date.now()
+    });
 
-      // Check minimum size
-      if (ringNodes.length < 3) {
-        console.log(`[${this.alias}] ⚠️  Ring has ${ringNodes.length} nodes (minimum 3 required)`);
-        this.ring = [];
-        this.successor = null;
-        this.predecessor = null;
-        return;
-      }
+    console.log(`[${this.alias}] 🔄 Added self to ring`);
+  }
 
-      // Sort nodes by alias to create a consistent ring order
-      this.ring = ringNodes.sort((a, b) => a.alias.localeCompare(b.alias));
+  /**
+   * Remove a member from the CRDT ring state
+   */
+  removeMemberFromRing(nodeId) {
+    const state = this.crdt.value();
+    const members = state.members || {};
 
-      // Find my position in the ring
-      const myIndex = this.ring.findIndex(n => n.alias === this.alias);
-
-      if (myIndex === -1) {
-        console.error(`[${this.alias}] Error: Can't find myself in the ring`);
-        return;
-      }
-
-      // Calculate successor and predecessor (circular)
-      const successorIndex = (myIndex + 1) % this.ring.length;
-      const predecessorIndex = (myIndex - 1 + this.ring.length) % this.ring.length;
-
-      this.successor = this.ring[successorIndex];
-      this.predecessor = this.ring[predecessorIndex];
-
-      console.log(`[${this.alias}] 🔄 Ring updated: ${this.ring.length} nodes`);
-      console.log(`[${this.alias}]    Predecessor: ${this.predecessor.alias}`);
-      console.log(`[${this.alias}]    Successor: ${this.successor.alias}`);
-
-      // Notify ring members of the updated structure
-      await this.broadcastRingUpdate();
-    } catch (err) {
-      console.error(`[${this.alias}] Failed to update ring:`, err.message);
+    if (members[nodeId]) {
+      this.crdt.del(['members', nodeId]);
+      console.log(`[${this.alias}] 🔄 Removed ${nodeId} from ring`);
     }
   }
 
   /**
-   * Broadcast ring update to all members
+   * Start periodic CRDT sync with peers
    */
-  async broadcastRingUpdate() {
-    const ringInfo = {
-      type: 'RING_UPDATE',
-      ring: this.ring.map(n => n.alias),
-      from: this.alias
-    };
+  startCrdtSync() {
+    this.syncInterval = setInterval(async () => {
+      await this.syncCrdtWithPeers();
+    }, 2000);
+  }
 
-    for (const node of this.ring) {
-      if (node.alias !== this.alias) {
+  /**
+   * Sync CRDT state with all peers
+   */
+  async syncCrdtWithPeers() {
+    try {
+      const peers = await this.node.discover();
+      const ringPeers = peers.filter(p => p.alias && p.alias.startsWith('ring-'));
+
+      if (ringPeers.length === 0) return;
+
+      // Send our vector clock and ops to all peers
+      const clock = this.crdt.clock();
+
+      for (const peer of ringPeers) {
         try {
-          await this.node.send(node.alias, ringInfo);
+          await this.node.send(peer.alias, {
+            type: 'CRDT_SYNC_REQUEST',
+            clock: clock,
+            from: this.alias,
+            nodeId: this.node.getNodeId()
+          });
         } catch (err) {
-          // Ignore send errors during updates
+          // Ignore send errors
         }
       }
+    } catch (err) {
+      // Ignore discovery errors
     }
+  }
+
+  /**
+   * Get current ring members sorted by consistent hash
+   */
+  getRingMembers() {
+    const state = this.crdt.value();
+    const members = state.members || {};
+
+    return Object.values(members)
+      .filter(m => m.alias && m.alias.startsWith('ring-'))
+      .map(m => ({
+        ...m,
+        hash: consistentHash(m.nodeId)
+      }))
+      .sort((a, b) => {
+        // Sort by hash value (ascending)
+        if (a.hash !== b.hash) return a.hash - b.hash;
+        // Tie-break on nodeId for stability
+        return a.nodeId.localeCompare(b.nodeId);
+      });
+  }
+
+  /**
+   * Get successor and predecessor in the ring
+   */
+  getRingNeighbors() {
+    const members = this.getRingMembers();
+
+    if (members.length < 3) {
+      return { successor: null, predecessor: null, ring: members };
+    }
+
+    const myIndex = members.findIndex(m => m.nodeId === this.node.getNodeId());
+
+    if (myIndex === -1) {
+      return { successor: null, predecessor: null, ring: members };
+    }
+
+    const successorIndex = (myIndex + 1) % members.length;
+    const predecessorIndex = (myIndex - 1 + members.length) % members.length;
+
+    return {
+      successor: members[successorIndex],
+      predecessor: members[predecessorIndex],
+      ring: members
+    };
   }
 
   /**
@@ -129,9 +190,16 @@ class RingNode {
    */
   handleMessage(message, meta) {
     switch (message.type) {
-      case 'RING_UPDATE':
-        // Acknowledge ring update from another node
-        console.log(`[${this.alias}] 📨 Ring update from ${message.from}`);
+      case 'CRDT_SYNC_REQUEST':
+        this.handleCrdtSyncRequest(message, meta);
+        break;
+
+      case 'CRDT_SYNC_RESPONSE':
+        this.handleCrdtSyncResponse(message, meta);
+        break;
+
+      case 'CRDT_OP':
+        this.handleCrdtOp(message, meta);
         break;
 
       case 'TOKEN':
@@ -140,11 +208,71 @@ class RingNode {
 
       case 'PING':
         console.log(`[${this.alias}] 📨 PING from ${meta.from}`);
-        this.node.send(meta.from, { type: 'PONG', original: message }).catch(() => {});
+        this.node.send(meta.from, { type: 'PONG', original: message }).catch(() => { });
         break;
 
       default:
         console.log(`[${this.alias}] 📨 Message from ${meta.from}:`, message);
+    }
+  }
+
+  /**
+   * Handle CRDT sync request
+   */
+  handleCrdtSyncRequest(message, meta) {
+    const remoteClock = message.clock;
+    const myOps = this.crdt.diffSince(remoteClock);
+
+    // Send back our ops that are newer
+    this.node.send(meta.from, {
+      type: 'CRDT_SYNC_RESPONSE',
+      ops: myOps.map(op => JSONCrdt.encodeOp(op)),
+      clock: this.crdt.clock()
+    }).catch(() => { });
+
+    // Also ensure the remote node is in our members if they're a ring node
+    if (message.nodeId && message.from && message.from.startsWith('ring-')) {
+      const state = this.crdt.value();
+      const members = state.members || {};
+
+      if (!members[message.nodeId]) {
+        this.crdt.set(['members', message.nodeId], {
+          alias: message.from,
+          nodeId: message.nodeId,
+          joinedAt: Date.now()
+        });
+      }
+    }
+  }
+
+  /**
+   * Handle CRDT sync response
+   */
+  handleCrdtSyncResponse(message, meta) {
+    // Apply received ops to our CRDT
+    const ops = message.ops.map(opStr => JSONCrdt.decodeOp(opStr));
+
+    let applied = 0;
+    for (const op of ops) {
+      if (this.crdt.receive(op)) {
+        applied++;
+      }
+    }
+
+    if (applied > 0) {
+      console.log(`[${this.alias}] 🔄 Applied ${applied} CRDT ops from ${meta.from}`);
+    }
+  }
+
+  /**
+   * Handle individual CRDT op
+   */
+  handleCrdtOp(message, meta) {
+    const op = JSONCrdt.decodeOp(message.op);
+    const applied = this.crdt.receive(op);
+
+    if (applied) {
+      console.log(`[${this.alias}] 🔄 Applied CRDT op from ${meta.from}`);
     }
   }
 
@@ -154,32 +282,43 @@ class RingNode {
   handleToken(message, meta) {
     console.log(`[${this.alias}] 🎫 Token received from ${meta.from} (round ${message.round}, hop ${message.hop})`);
 
-    if (message.hop >= this.ring.length) {
+    const { ring } = this.getRingNeighbors();
+
+    if (message.hop >= ring.length) {
       console.log(`[${this.alias}] ✅ Token completed round ${message.round}`);
-      
+
+      // Update token state in CRDT
+      this.crdt.set(['token'], {
+        round: message.round,
+        completedAt: Date.now(),
+        completedBy: this.alias
+      });
+
       // Start new round
       setTimeout(() => {
-        if (this.successor) {
+        const { successor } = this.getRingNeighbors();
+        if (successor) {
           console.log(`[${this.alias}] 🎫 Starting new token round ${message.round + 1}`);
-          this.node.send(this.successor.alias, {
+          this.node.send(successor.alias, {
             type: 'TOKEN',
             round: message.round + 1,
             hop: 1,
             initiator: this.alias
-          }).catch(() => {});
+          }).catch(() => { });
         }
       }, 2000);
     } else {
       // Pass token to successor
       setTimeout(() => {
-        if (this.successor) {
-          console.log(`[${this.alias}] 🎫 Passing token to ${this.successor.alias}`);
-          this.node.send(this.successor.alias, {
+        const { successor } = this.getRingNeighbors();
+        if (successor) {
+          console.log(`[${this.alias}] 🎫 Passing token to ${successor.alias}`);
+          this.node.send(successor.alias, {
             type: 'TOKEN',
             round: message.round,
             hop: message.hop + 1,
             initiator: message.initiator
-          }).catch(() => {});
+          }).catch(() => { });
         }
       }, 1000);
     }
@@ -189,28 +328,48 @@ class RingNode {
    * Display current ring status
    */
   displayRingStatus() {
-    if (this.ring.length < 3) {
-      console.log(`[${this.alias}] 📊 Status: Waiting for minimum 3 nodes (current: ${this.ring.length})`);
+    const { ring, successor, predecessor } = this.getRingNeighbors();
+
+    if (ring.length < 3) {
+      console.log(`[${this.alias}] 📊 Status: Waiting for minimum 3 nodes (current: ${ring.length})`);
       return;
     }
 
-    const ringOrder = this.ring.map((n, i) => {
-      if (n.alias === this.alias) {
-        return `[${n.alias}]`; // Mark self with brackets
+    const ringOrder = ring.map((n) => {
+      const hashStr = n.hash.toString(16).substring(0, 8);
+      if (n.nodeId === this.node.getNodeId()) {
+        return `[${n.alias}@${hashStr}]`; // Mark self with brackets
       }
-      return n.alias;
+      return `${n.alias}@${hashStr}`;
     }).join(' → ');
 
     console.log(`[${this.alias}] 📊 Ring: ${ringOrder} → (cycle)`);
+
+    // Display CRDT info
+    const state = this.crdt.value();
+    const clock = this.crdt.clock();
+    const clockStr = Object.entries(clock)
+      .map(([id, v]) => `${id.slice(0, 8)}:${v}`)
+      .join(', ');
+
+    if (clockStr) {
+      console.log(`[${this.alias}] 🕐 Vector Clock: {${clockStr}}`);
+    }
+
+    if (state.token) {
+      console.log(`[${this.alias}] 🎫 Last token: round ${state.token.round} by ${state.token.completedBy}`);
+    }
   }
 
   /**
    * Initiate a token in the ring (only if we're the first node)
    */
   async initiateToken() {
-    if (this.ring.length >= 3 && this.successor) {
+    const { ring, successor } = this.getRingNeighbors();
+
+    if (ring.length >= 3 && successor) {
       console.log(`[${this.alias}] 🎫 Initiating token in the ring`);
-      await this.node.send(this.successor.alias, {
+      await this.node.send(successor.alias, {
         type: 'TOKEN',
         round: 1,
         hop: 1,
@@ -218,14 +377,23 @@ class RingNode {
       });
     }
   }
+
+  async stop() {
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+    }
+    if (this.node) {
+      await this.node.stop();
+    }
+  }
 }
 
 // Main
 async function main() {
   const alias = process.argv[2] || `ring-${Math.floor(Math.random() * 1000)}`;
-  
+
   console.log('='.repeat(60));
-  console.log('Ring Topology Example');
+  console.log('Ring Topology Example (with CRDT state)');
   console.log('='.repeat(60));
   console.log(`Node alias: ${alias}`);
   console.log('');
@@ -237,17 +405,11 @@ async function main() {
   console.log(`[${alias}] Use Ctrl+C to stop`);
   console.log('');
 
-  // If this is ring-1, initiate a token after some time
-  if (alias === 'ring-1') {
-    setTimeout(() => {
-      ringNode.initiateToken();
-    }, 10000);
-  }
 
   // Graceful shutdown
   process.on('SIGINT', async () => {
     console.log(`\n[${alias}] Shutting down...`);
-    await ringNode.node.stop();
+    await ringNode.stop();
     process.exit(0);
   });
 }

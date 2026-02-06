@@ -113,6 +113,7 @@ Consultez le dossier `examples/` pour des exemples complets :
 ### PMD (Port Mapper Daemon)
 
 Le PMD est un daemon local qui :
+
 - Enregistre les nœuds avec leurs ports
 - Maintient un mapping alias → nodeId → host:port
 - Gère le TTL et les heartbeats
@@ -121,6 +122,7 @@ Le PMD est un daemon local qui :
 ### Node Runtime
 
 Chaque processus peut démarrer **un seul nœud** qui :
+
 - Lance automatiquement le PMD si absent
 - S'enregistre automatiquement
 - Maintient une connexion heartbeat
@@ -133,6 +135,150 @@ Chaque processus peut démarrer **un seul nœud** qui :
 - **Format** : JSON uniquement
 - **Modèle** : fire-and-forget (pas d'appel synchrone)
 - **Mailbox** : FIFO avec taille configurable et stratégie drop-newest
+
+## Flux de Communication
+
+### Démarrage d'un nœud
+
+Le diagramme suivant illustre le processus de démarrage d'un nœud et son enregistrement auprès du PMD :
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Node as NodeRuntime
+    participant PMD as PMD Daemon
+    
+    App->>Node: NodeRuntime.start({alias})
+    
+    alt PMD non démarré
+        Node->>PMD: Démarrage automatique
+        PMD-->>PMD: Écoute sur port 4369
+    end
+    
+    Node->>Node: Génère nodeId unique
+    Node->>Node: Démarre serveur TCP
+    Node->>PMD: REGISTER {alias, nodeId, port}
+    PMD-->>PMD: Stocke mapping
+    PMD-->>Node: OK {nodeId}
+    
+    Node->>PMD: Watch (abonnement événements)
+    PMD-->>Node: Liste nœuds existants
+    
+    loop Heartbeat (toutes les 5s)
+        Node->>PMD: HEARTBEAT {nodeId}
+        PMD-->>Node: OK
+    end
+    
+    Node-->>App: Instance NodeRuntime
+```
+
+### Communication entre nœuds
+
+Le diagramme suivant montre comment deux nœuds communiquent via le PMD :
+
+```mermaid
+sequenceDiagram
+    participant N1 as Node A
+    participant PMD as PMD Daemon
+    participant N2 as Node B
+    
+    Note over N1,N2: Les deux nœuds sont enregistrés
+    
+    N1->>PMD: RESOLVE "node-b"
+    PMD-->>N1: {nodeId, host, port}
+    
+    N1->>N1: Cache la résolution
+    N1->>N2: Connexion TCP (host:port)
+    N1->>N2: Message JSON {"type": "HELLO"}
+    
+    N2->>N2: Mailbox enqueue
+    N2->>N2: onMessage callback
+    
+    Note over N1,N2: Connexion réutilisée pour messages suivants
+    
+    N1->>N2: Message suivant
+    N2->>N2: Mailbox enqueue
+```
+
+### Découverte de pairs et événements
+
+Le diagramme suivant illustre le mécanisme de découverte et les événements `peer:join` / `peer:leave` :
+
+```mermaid
+sequenceDiagram
+    participant N1 as Node A (watcher)
+    participant PMD as PMD Daemon
+    participant N2 as Node B (nouveau)
+    
+    Note over N1,PMD: Node A est déjà enregistré et watch
+    
+    N2->>PMD: REGISTER "node-b"
+    PMD-->>PMD: Ajoute Node B
+    PMD-->>N2: OK
+    
+    PMD->>N1: PEER_JOIN {alias: "node-b", nodeId, ...}
+    N1->>N1: Émet événement 'peer:join'
+    
+    Note over N1,N2: Les nœuds peuvent maintenant communiquer
+    
+    alt Node B arrêt normal
+        N2->>PMD: UNREGISTER
+        PMD-->>PMD: Retire Node B
+    else Timeout heartbeat
+        PMD-->>PMD: Détecte absence heartbeat
+        PMD-->>PMD: Retire Node B (TTL expiré)
+    end
+    
+    PMD->>N1: PEER_LEAVE {alias: "node-b", nodeId}
+    N1->>N1: Émet événement 'peer:leave'
+```
+
+### Architecture globale
+
+```mermaid
+graph TB
+    subgraph "Process 1"
+        App1[Application 1]
+        Node1[NodeRuntime A]
+        Mail1[Mailbox A]
+        TCP1[TCP Server :PORT1]
+    end
+    
+    subgraph "Process 2"
+        App2[Application 2]
+        Node2[NodeRuntime B]
+        Mail2[Mailbox B]
+        TCP2[TCP Server :PORT2]
+    end
+    
+    subgraph "PMD Process"
+        PMD[PMD Daemon :4369]
+        Registry[(Registry<br/>alias → nodeId → port)]
+        Watchers[Watchers Manager]
+    end
+    
+    App1 --> Node1
+    Node1 --> Mail1
+    Node1 --> TCP1
+    
+    App2 --> Node2
+    Node2 --> Mail2
+    Node2 --> TCP2
+    
+    Node1 -.REGISTER/HEARTBEAT.-> PMD
+    Node2 -.REGISTER/HEARTBEAT.-> PMD
+    PMD --> Registry
+    PMD --> Watchers
+    
+    Watchers -.PEER_JOIN/LEAVE.-> Node1
+    Watchers -.PEER_JOIN/LEAVE.-> Node2
+    
+    TCP1 <-->|Messages JSON| TCP2
+    
+    style PMD fill:#e1f5ff
+    style Registry fill:#ffe1e1
+    style Watchers fill:#ffe1e1
+```
 
 ## Développement
 
