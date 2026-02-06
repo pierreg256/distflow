@@ -24,7 +24,7 @@ Framework TypeScript pour le développement distribué inspiré du modèle Erlan
 
 ## Structure du projet
 
-```
+```bash
 distflow/
 ├── packages/
 │   ├── core/     # Librairie principale (@distflow/core)
