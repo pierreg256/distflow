@@ -10,6 +10,10 @@ export {
   ReplicaId,
   CrdtSnapshot,
   CrdtOptions,
+  CrdtMetrics,
+  CrdtInspection,
+  CausalGraphNode,
+  SnapshotDiff,
   Hlc,
   OpKind
 } from './json-crdt';

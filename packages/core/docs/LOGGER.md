@@ -114,7 +114,7 @@ configureLogger({ transport: fileTransport });
 
 ### Pretty Print (développement)
 
-```
+```bash
 2026-02-07T10:30:45.123Z INFO  [my-service] User logged in {"userId":"user-123","ip":"192.168.1.1"}
 2026-02-07T10:30:46.456Z WARN  [my-service] High memory usage {"usage":"85%"}
 2026-02-07T10:30:47.789Z ERROR [my-service] Database connection failed {"error":"ECONNREFUSED"}

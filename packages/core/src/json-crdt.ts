@@ -61,6 +61,94 @@ export interface CrdtOptions {
   enableAutoGc?: boolean;       // Auto GC on operations (default: true)
 }
 
+/**
+ * Observability metrics
+ */
+export interface CrdtMetrics {
+  // Operation counters
+  totalOps: number;             // Total ops (local + remote)
+  localOps: number;             // Local ops created
+  remoteOps: number;            // Remote ops received
+
+  // Performance
+  opsPerSecond: number;         // Operations per second (rolling window)
+  avgLatencyMs: number;         // Average op application latency
+
+  // Conflicts
+  totalConflicts: number;       // Total conflicts detected
+  tombstoneConflicts: number;   // Conflicts with tombstones
+  pathConflicts: number;        // Parent/child path conflicts
+
+  // Garbage collection
+  gcRuns: number;               // Total GC runs
+  gcLogOps: number;             // Total ops removed from log
+  gcTombstones: number;         // Total tombstones removed
+  gcPendingOps: number;         // Total pending ops cleaned
+
+  // Current state
+  logSize: number;
+  pendingSize: number;
+  lwwSize: number;
+  tombstonesSize: number;
+  vcSize: number;
+}
+
+/**
+ * Inspection data for debugging
+ */
+export interface CrdtInspection {
+  replicaId: ReplicaId;
+  doc: JsonValue;
+  vc: VectorClock;
+  hlc: Hlc;
+  logSize: number;
+  logSample: Op[];              // Last N ops from log
+  pendingSize: number;
+  pendingSample: Op[];          // Sample of pending ops
+  lwwPaths: string[];           // All paths in LWW map
+  tombstonePaths: string[];     // All tombstone paths
+  metrics: CrdtMetrics;
+  causalGraph?: CausalGraphNode[]; // Optional causal dependency graph
+}
+
+export interface CausalGraphNode {
+  opId: string;
+  kind: OpKind;
+  path: string;
+  hlc: Hlc;
+  deps: string[];               // Dependencies (replica:seq format)
+}
+
+/**
+ * Diff between two snapshots
+ */
+export interface SnapshotDiff {
+  docChanges: Array<{
+    path: Path;
+    before?: JsonValue;
+    after?: JsonValue;
+    type: 'added' | 'removed' | 'modified';
+  }>;
+  vcChanges: Array<{
+    replica: ReplicaId;
+    before: number;
+    after: number;
+  }>;
+  hlcDiff: {
+    before: Hlc;
+    after: Hlc;
+  };
+  lwwChanges: {
+    added: string[];
+    removed: string[];
+    modified: string[];
+  };
+  tombstoneChanges: {
+    added: string[];
+    removed: string[];
+  };
+}
+
 export interface Op {
   id: string;        // unique op id (stable)
   kind: OpKind;
@@ -195,6 +283,22 @@ export class JSONCrdt extends EventEmitter {
   // pending ops (not causally ready)
   private pending: Array<{ op: Op; receivedAt: number }>;
 
+  // Observability: metrics tracking
+  private metrics: {
+    totalOps: number;
+    localOps: number;
+    remoteOps: number;
+    totalConflicts: number;
+    tombstoneConflicts: number;
+    pathConflicts: number;
+    gcRuns: number;
+    gcLogOps: number;
+    gcTombstones: number;
+    gcPendingOps: number;
+    opTimestamps: number[];       // Rolling window for ops/sec calculation
+    latencies: number[];          // Rolling window for latency calculation
+  };
+
   constructor(replica: ReplicaId, initial: JsonValue = {}, options: CrdtOptions = {}) {
     super();
     this.replica = replica;
@@ -215,6 +319,22 @@ export class JSONCrdt extends EventEmitter {
     this.tombstones = new Map();
     this.log = [];
     this.pending = [];
+
+    // Initialize metrics
+    this.metrics = {
+      totalOps: 0,
+      localOps: 0,
+      remoteOps: 0,
+      totalConflicts: 0,
+      tombstoneConflicts: 0,
+      pathConflicts: 0,
+      gcRuns: 0,
+      gcLogOps: 0,
+      gcTombstones: 0,
+      gcPendingOps: 0,
+      opTimestamps: [],
+      latencies: []
+    };
 
     logger.debug('CRDT initialized', {
       replicaId: this.replica.substring(0, 8),
@@ -239,11 +359,18 @@ export class JSONCrdt extends EventEmitter {
 
   /** Create and apply local SET */
   set(path: Path, value: JsonValue): Op {
+    const startTime = Date.now();
+
     // Check for parent/child conflicts
     this.checkPathConflicts(path, 'set');
 
     const op = this.makeLocalOp("set", path, value);
     this.applyOp(op);
+
+    // Track metrics
+    this.metrics.totalOps++;
+    this.metrics.localOps++;
+    this.trackOpTiming(startTime);
 
     if (this.options.enableAutoGc) {
       this.autoGc();
@@ -256,13 +383,28 @@ export class JSONCrdt extends EventEmitter {
       op
     });
 
+    logger.debug('Local SET', {
+      replicaId: this.replica.substring(0, 8),
+      path,
+      opId: op.id,
+      hlc: op.hlc,
+      vc: op.deps
+    });
+
     return op;
   }
 
   /** Create and apply local DELETE */
   del(path: Path): Op {
+    const startTime = Date.now();
+
     const op = this.makeLocalOp("tombstone", path);
     this.applyOp(op);
+
+    // Track metrics
+    this.metrics.totalOps++;
+    this.metrics.localOps++;
+    this.trackOpTiming(startTime);
 
     if (this.options.enableAutoGc) {
       this.autoGc();
@@ -274,11 +416,20 @@ export class JSONCrdt extends EventEmitter {
       op
     });
 
+    logger.debug('Local DEL (tombstone)', {
+      replicaId: this.replica.substring(0, 8),
+      path,
+      opId: op.id,
+      hlc: op.hlc
+    });
+
     return op;
   }
 
   /** Receive remote op (buffers if not causally ready) */
   receive(op: Op): boolean {
+    const startTime = Date.now();
+
     if (this.seen(op)) return false;
 
     // Check pending buffer size
@@ -292,10 +443,28 @@ export class JSONCrdt extends EventEmitter {
 
     if (!isCausallyReady(this.vc, op)) {
       this.pending.push({ op, receivedAt: Date.now() });
+      logger.debug('Op buffered (not causally ready)', {
+        opId: op.id,
+        opDeps: op.deps,
+        localVc: this.vc
+      });
       return false;
     }
 
     this.applyOp(op);
+
+    // Track metrics
+    this.metrics.totalOps++;
+    this.metrics.remoteOps++;
+    this.trackOpTiming(startTime);
+
+    logger.debug('Remote op applied', {
+      replicaId: this.replica.substring(0, 8),
+      opId: op.id,
+      src: op.src.substring(0, 8),
+      kind: op.kind,
+      path: op.path
+    });
 
     // try drain pending
     this.drainPending();
@@ -338,6 +507,10 @@ export class JSONCrdt extends EventEmitter {
     const removed = this.log.length - keep;
     this.log = this.log.slice(-keep);
 
+    // Track metrics
+    this.metrics.gcRuns++;
+    this.metrics.gcLogOps += removed;
+
     logger.debug('Log GC performed', {
       removedOps: removed,
       logSize: this.log.length
@@ -362,6 +535,10 @@ export class JSONCrdt extends EventEmitter {
 
     const removed = before - this.pending.length;
     if (removed > 0) {
+      // Track metrics
+      this.metrics.gcRuns++;
+      this.metrics.gcPendingOps += removed;
+
       logger.warn('Cleaned pending buffer', {
         removedOps: removed,
         pendingSize: this.pending.length
@@ -391,6 +568,10 @@ export class JSONCrdt extends EventEmitter {
     toDelete.forEach(key => this.tombstones.delete(key));
 
     if (toDelete.length > 0) {
+      // Track metrics
+      this.metrics.gcRuns++;
+      this.metrics.gcTombstones += toDelete.length;
+
       logger.debug('Tombstone GC performed', {
         removedTombstones: toDelete.length,
         tombstonesSize: this.tombstones.size
@@ -474,6 +655,10 @@ export class JSONCrdt extends EventEmitter {
       const parentKey = this.pathKey(parentPath);
 
       if (this.tombstones.has(parentKey)) {
+        // Track conflict
+        this.metrics.totalConflicts++;
+        this.metrics.pathConflicts++;
+
         logger.warn('Path conflict detected: parent is tombstone', {
           path,
           parentPath,
@@ -515,6 +700,222 @@ export class JSONCrdt extends EventEmitter {
       tombstonesSize: this.tombstones.size,
       vcSize: Object.keys(this.vc).length
     };
+  }
+
+  /** Get comprehensive metrics for observability */
+  getMetrics(): CrdtMetrics {
+    const now = Date.now();
+
+    // Calculate ops/sec (last 60 seconds)
+    const recentOps = this.metrics.opTimestamps.filter(t => now - t < 60000);
+    const opsPerSecond = recentOps.length / 60;
+
+    // Calculate average latency
+    const avgLatencyMs = this.metrics.latencies.length > 0
+      ? this.metrics.latencies.reduce((a, b) => a + b, 0) / this.metrics.latencies.length
+      : 0;
+
+    return {
+      totalOps: this.metrics.totalOps,
+      localOps: this.metrics.localOps,
+      remoteOps: this.metrics.remoteOps,
+      opsPerSecond,
+      avgLatencyMs,
+      totalConflicts: this.metrics.totalConflicts,
+      tombstoneConflicts: this.metrics.tombstoneConflicts,
+      pathConflicts: this.metrics.pathConflicts,
+      gcRuns: this.metrics.gcRuns,
+      gcLogOps: this.metrics.gcLogOps,
+      gcTombstones: this.metrics.gcTombstones,
+      gcPendingOps: this.metrics.gcPendingOps,
+      logSize: this.log.length,
+      pendingSize: this.pending.length,
+      lwwSize: this.lww.size,
+      tombstonesSize: this.tombstones.size,
+      vcSize: Object.keys(this.vc).length
+    };
+  }
+
+  /** Inspect internal state for debugging */
+  inspect(options: {
+    logSampleSize?: number;
+    pendingSampleSize?: number;
+    includeCausalGraph?: boolean;
+  } = {}): CrdtInspection {
+    const {
+      logSampleSize = 10,
+      pendingSampleSize = 10,
+      includeCausalGraph = false
+    } = options;
+
+    const logSample = this.log.slice(-logSampleSize);
+    const pendingSample = this.pending.slice(0, pendingSampleSize).map(p => p.op);
+
+    const lwwPaths = Array.from(this.lww.keys());
+    const tombstonePaths = Array.from(this.tombstones.keys());
+
+    const inspection: CrdtInspection = {
+      replicaId: this.replica,
+      doc: cloneJson(this.doc),
+      vc: { ...this.vc },
+      hlc: { ...this.hlc },
+      logSize: this.log.length,
+      logSample,
+      pendingSize: this.pending.length,
+      pendingSample,
+      lwwPaths,
+      tombstonePaths,
+      metrics: this.getMetrics()
+    };
+
+    if (includeCausalGraph) {
+      inspection.causalGraph = this.getCausalGraph();
+    }
+
+    return inspection;
+  }
+
+  /** Get causal dependency graph */
+  getCausalGraph(): CausalGraphNode[] {
+    return this.log.map(op => ({
+      opId: op.id,
+      kind: op.kind,
+      path: this.pathKey(op.path),
+      hlc: op.hlc,
+      deps: Object.entries(op.deps).map(([r, seq]) => `${r.substring(0, 8)}:${seq}`)
+    }));
+  }
+
+  /** Diff two snapshots */
+  static diffSnapshots(before: CrdtSnapshot, after: CrdtSnapshot): SnapshotDiff {
+    const diff: SnapshotDiff = {
+      docChanges: [],
+      vcChanges: [],
+      hlcDiff: {
+        before: before.hlc,
+        after: after.hlc
+      },
+      lwwChanges: {
+        added: [],
+        removed: [],
+        modified: []
+      },
+      tombstoneChanges: {
+        added: [],
+        removed: []
+      }
+    };
+
+    // Compare vector clocks
+    const allReplicas = new Set([
+      ...Object.keys(before.vc),
+      ...Object.keys(after.vc)
+    ]);
+
+    for (const replica of allReplicas) {
+      const beforeVal = before.vc[replica] ?? 0;
+      const afterVal = after.vc[replica] ?? 0;
+      if (beforeVal !== afterVal) {
+        diff.vcChanges.push({ replica, before: beforeVal, after: afterVal });
+      }
+    }
+
+    // Compare LWW maps
+    const beforeLww = new Map(before.lww);
+    const afterLww = new Map(after.lww);
+
+    for (const [key] of beforeLww) {
+      if (!afterLww.has(key)) {
+        diff.lwwChanges.removed.push(key);
+      }
+    }
+
+    for (const [key, hlc] of afterLww) {
+      if (!beforeLww.has(key)) {
+        diff.lwwChanges.added.push(key);
+      } else {
+        const beforeHlc = beforeLww.get(key)!;
+        if (compareHlc(beforeHlc, hlc) !== 0) {
+          diff.lwwChanges.modified.push(key);
+        }
+      }
+    }
+
+    // Compare tombstones
+    const beforeTombstones = new Map(before.tombstones);
+    const afterTombstones = new Map(after.tombstones);
+
+    for (const [key] of beforeTombstones) {
+      if (!afterTombstones.has(key)) {
+        diff.tombstoneChanges.removed.push(key);
+      }
+    }
+
+    for (const [key] of afterTombstones) {
+      if (!beforeTombstones.has(key)) {
+        diff.tombstoneChanges.added.push(key);
+      }
+    }
+
+    // Document changes (simplified - deep diff would be more complex)
+    if (JSON.stringify(before.doc) !== JSON.stringify(after.doc)) {
+      diff.docChanges.push({
+        path: [],
+        before: before.doc,
+        after: after.doc,
+        type: 'modified'
+      });
+    }
+
+    return diff;
+  }
+
+  /** Replay log from beginning or a specific point */
+  replay(options: {
+    fromIndex?: number;
+    toIndex?: number;
+    onOp?: (op: Op, index: number) => void;
+  } = {}): JsonValue {
+    const {
+      fromIndex = 0,
+      toIndex = this.log.length,
+      onOp
+    } = options;
+
+    // Create a temporary CRDT instance
+    const tempCrdt = new JSONCrdt(this.replica, {}, this.options);
+
+    // Replay operations
+    for (let i = fromIndex; i < toIndex && i < this.log.length; i++) {
+      const op = this.log[i]!;
+      tempCrdt.receive(op);
+
+      if (onOp) {
+        onOp(op, i);
+      }
+    }
+
+    return tempCrdt.value();
+  }
+
+  /** Track operation timing for metrics */
+  private trackOpTiming(startTime: number): void {
+    const latency = Date.now() - startTime;
+    const now = Date.now();
+
+    // Track timestamp (keep last 1 minute for ops/sec calculation)
+    this.metrics.opTimestamps.push(now);
+    if (this.metrics.opTimestamps.length > 10000) {
+      // Keep only recent ones
+      const cutoff = now - 60000;
+      this.metrics.opTimestamps = this.metrics.opTimestamps.filter(t => t > cutoff);
+    }
+
+    // Track latency (keep rolling window of 1000)
+    this.metrics.latencies.push(latency);
+    if (this.metrics.latencies.length > 1000) {
+      this.metrics.latencies.shift();
+    }
   }
 
   // ---- internals ----
@@ -579,6 +980,10 @@ export class JSONCrdt extends EventEmitter {
       // Check if there's a tombstone that's newer
       const tombstone = this.tombstones.get(key);
       if (tombstone && compareHlc(tombstone, op.hlc) > 0) {
+        // Track conflict
+        this.metrics.totalConflicts++;
+        this.metrics.tombstoneConflicts++;
+
         logger.warn('SET rejected: newer tombstone exists', {
           path: op.path,
           setHlc: op.hlc,

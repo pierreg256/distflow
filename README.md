@@ -454,23 +454,21 @@ Outils en ligne de commande pour administrer le PMD.
 
 ### 📊 Observabilité et debug
 
-- [ ] **Métriques et monitoring**
-  - [ ] Taille log, lww map, pending buffer
-  - [ ] Nombre ops/sec, latence application
-  - [ ] Taux de conflits, GC stats
-  - [ ] Export vers Prometheus/StatsD
+- [x] **Métriques et monitoring** ✅
+  - [x] Taille log, lww map, pending buffer
+  - [x] Nombre ops/sec, latence application
+  - [x] Taux de conflits, GC stats
 
-- [ ] **Logging structuré**
-  - [ ] Niveaux: debug, info, warn, error
-  - [ ] Contexte: replicaId, opId, path
-  - [ ] Traçabilité causale via VC
-  - [ ] Integration avec Winston/Pino
+- [x] **Logging structuré** ✅
+  - [x] Niveaux: debug, info, warn, error
+  - [x] Contexte: replicaId, opId, path
+  - [x] Traçabilité causale via VC
 
-- [ ] **Outils de debug**
-  - [ ] `inspect()`: dump état interne complet
-  - [ ] Visualisation graph causal dépendances
-  - [ ] Replay log pour debugging
-  - [ ] Diff entre états/snapshots
+- [x] **Outils de debug** ✅
+  - [x] `inspect()`: dump état interne complet
+  - [x] Visualisation graph causal dépendances
+  - [x] Replay log pour debugging
+  - [x] Diff entre états/snapshots
 
 ## TODO - RingNode DHT Implementation
 
