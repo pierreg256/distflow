@@ -100,7 +100,7 @@ export class Logger {
   private transport: LogTransport;
 
   constructor(options: LoggerOptions = {}) {
-    this.level = options.level ?? LogLevel.INFO;
+    this.level = options.level ?? LogLevel.DEBUG;
     this.name = options.name;
     this.context = options.context ?? {};
     this.transport = options.transport ?? new ConsoleTransport(options.prettyPrint ?? true);

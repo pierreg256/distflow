@@ -6,13 +6,17 @@ const http = require('http');
  */
 class RingNodeWithWeb extends RingNode {
   constructor(alias, webPort = 0) {
-    super({ alias });
+    super({ alias, metricsIntervalMs: 0, displayIntervalMs: 0 }); // Disable default metrics logging
     this.httpServer = null;
     this.webPort = webPort; // Port for web server (0 = random)
     this.sseClients = []; // SSE clients for real-time updates
   }
 
   async start() {
+    this.on('ring:topology-change', () => {
+      console.log("je l'ai eu")
+      this.notifyTopologyChange();
+    });
     await super.start();
 
     // Start web server
@@ -22,9 +26,10 @@ class RingNodeWithWeb extends RingNode {
   /**
    * Override topology change hook to notify web clients
    */
-  onTopologyChange() {
-    this.notifyTopologyChange();
-  }
+  // onTopologyChange() {
+  //   super.onTopologyChange();
+  //   this.notifyTopologyChange();
+  // }
 
   /**
    * Notify all SSE clients of topology change
@@ -564,7 +569,7 @@ async function main() {
   // Graceful shutdown
   process.on('SIGINT', async () => {
     console.log(`\n[${alias}] Shutting down...`);
-    await ringNode.stop();
+    /*await*/ ringNode.stop();
     process.exit(0);
   });
 }

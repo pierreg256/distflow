@@ -27,6 +27,8 @@ Framework TypeScript pour le développement distribué inspiré du modèle Erlan
 ✅ Logger structuré avec niveaux et contextes  
 ✅ JSON-CRDT pour état distribué  
 ✅ RingNode pour topologies en anneau  
+✅ Détection de stabilité du ring avec événements  
+✅ DHT (Distributed Hash Table) avec stockage clé-valeur  
 
 ## Structure du projet
 
@@ -139,6 +141,57 @@ requestLogger.info("Processing completed", { duration: 123 });
 
 📖 Voir [packages/core/docs/LOGGER.md](packages/core/docs/LOGGER.md) pour la documentation complète.
 
+### Stabilité du Ring
+
+Le RingNode fournit un système de détection de stabilité permettant de savoir quand votre ring distribué est stable et prêt.
+
+```typescript
+import { RingNode } from "@distflow/core";
+
+const ring = new RingNode({ 
+  alias: 'my-service',
+  replicationFactor: 3,           // Nombre minimum de nœuds requis (défaut: 3)
+  requiredStableTimeMs: 5000      // Temps sans changement pour être stable (défaut: 5s)
+});
+
+// Écouter les événements de stabilité
+ring.on('ring:stable', (info) => {
+  console.log('✅ Ring stable avec', info.memberCount, 'membres');
+  console.log('   (minimum requis:', info.replicationFactor, ')');
+});
+
+ring.on('ring:unstable', (info) => {
+  console.log('⚠️  Ring instable, changement en cours');
+});
+
+await ring.start();
+
+// Attendre la stabilité avant de servir du trafic
+await ring.waitForStable(30000);
+console.log('Ring prêt à servir des requêtes');
+
+// Vérifier l'état actuel
+if (ring.isStable()) {
+  const info = ring.getStabilityInfo();
+  console.log('Stable depuis', info.timeSinceLastChangeMs, 'ms');
+  console.log('Membres:', info.memberCount, '/', info.replicationFactor);
+}
+```
+
+**Méthodes clés** :
+
+- `isStable()` : Vérifier si le ring est stable
+- `getStabilityInfo()` : Obtenir infos détaillées (nombre de membres, temps depuis changement, etc.)
+- `waitForStable(timeout)` : Attendre que le ring devienne stable
+- `getMemberCount()` : Obtenir le nombre de membres
+
+**Événements** :
+
+- `ring:stable` : Émis quand le ring devient stable
+- `ring:unstable` : Émis lors d'un changement de topologie
+
+📖 Voir [packages/core/docs/RING-STABILITY.md](packages/core/docs/RING-STABILITY.md) pour la documentation complète et les patterns d'utilisation.
+
 ## Exemples
 
 Consultez le dossier `examples/` pour des exemples complets :
@@ -173,6 +226,42 @@ Chaque processus peut démarrer **un seul nœud** qui :
 - **Format** : JSON uniquement
 - **Modèle** : fire-and-forget (pas d'appel synchrone)
 - **Mailbox** : FIFO avec taille configurable et stratégie drop-newest
+
+#### Pattern Async Request/Response
+
+Pour les opérations nécessitant une réponse (DHT GET, stabilization, etc.), distflow utilise un pattern asynchrone basé sur:
+
+- **Request IDs uniques** : corrélation entre requêtes et réponses
+- **Promises Map** : stockage des callbacks en attente
+- **Timeouts** : gestion automatique des requêtes qui expirent
+- **Fire-and-forget** : respect du modèle de base (pas de retour de `send()`)
+
+```typescript
+// ✅ CORRECT - Pattern async avec Promise
+public async get(key: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const requestId = this.generateRequestId();
+    this.pendingRequests.set(requestId, { resolve, reject, timeout });
+    
+    // Fire and forget - pas de await sur send()
+    this.node.send(targetAlias, {
+      type: 'DHT_GET',
+      requestId,
+      key
+    }).catch(reject);
+  });
+}
+
+// Handler de réponse résout la Promise
+protected handleDhtGetResponse(message: any): void {
+  const pending = this.pendingRequests.get(message.requestId);
+  if (pending) {
+    pending.resolve(message.value);
+  }
+}
+```
+
+📖 Voir [packages/core/docs/ASYNC-REQUEST-RESPONSE.md](packages/core/docs/ASYNC-REQUEST-RESPONSE.md) pour la documentation complète de ce pattern.
 
 ## Flux de Communication
 
@@ -474,21 +563,21 @@ Outils en ligne de commande pour administrer le PMD.
 
 ### 🎯 Court terme (essentiel)
 
-- [ ] **Stockage et partitionnement de données**
-  - [ ] Ajouter `findResponsibleNode(key: string): RingMember`
-  - [ ] Implémenter `put(key: string, value: any): Promise<void>`
-  - [ ] Implémenter `get(key: string): Promise<any>`
-  - [ ] Ajouter stockage local clé-valeur avec plages de responsabilité
+- [x] **Stockage et partitionnement de données** ✅
+  - [x] Ajouter `findResponsibleNode(key: string): RingMember`
+  - [x] Implémenter `put(key: string, value: any): Promise<void>`
+  - [x] Implémenter `get(key: string): Promise<any>`
+  - [x] Ajouter stockage local clé-valeur avec plages de responsabilité
 
-- [ ] **Successor list (résilience)**
-  - [ ] Remplacer successor unique par `successorList: RingMember[]` (3-5 nœuds)
-  - [ ] Implémenter basculement automatique si successor principal tombe
-  - [ ] Maintenir la liste à jour lors des changements de topologie
+- [x] **Successor list (résilience)** ✅
+  - [x] Remplacer successor unique par `successorList: RingMember[]` (3-5 nœuds)
+  - [x] Implémenter basculement automatique si successor principal tombe
+  - [x] Maintenir la liste à jour lors des changements de topologie
 
-- [ ] **Protocole de stabilisation**
-  - [ ] Implémenter `stabilize()`: vérifier et corriger le successor
-  - [ ] Implémenter `notify(node)`: notifier qu'on pense être predecessor
-  - [ ] Ajouter tâche périodique de stabilisation (ex: toutes les 10s)
+- [x] **Protocole de stabilisation** ✅
+  - [x] Implémenter `stabilize()`: vérifier et corriger le successor
+  - [x] Implémenter `notify(node)`: notifier qu'on pense être predecessor
+  - [x] Ajouter tâche périodique de stabilisation (ex: toutes les 10s)
 
 ### 🛠️ Moyen terme (robustesse)
 

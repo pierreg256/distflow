@@ -8,6 +8,9 @@ import { EventEmitter } from 'events';
 import { Mailbox, MailboxConfig, MessageMetadata } from './mailbox';
 import { PMDClient, NodeInfo } from './pmd-client';
 import { Transport } from './transport';
+import { configureLogger, LogLevel,  } from './logger';
+
+const logger = configureLogger({ name: 'node-runtime', level: LogLevel.INFO });
 
 /**
  * Node runtime configuration
@@ -73,7 +76,7 @@ export class NodeRuntime extends EventEmitter {
 
     // Create lock file to prevent multiple instances
     const lockFile = path.join(os.tmpdir(), `distflow-node-${process.pid}.lock`);
-    
+
     if (fs.existsSync(lockFile)) {
       throw new Error('Node already running in this process');
     }
@@ -146,7 +149,7 @@ export class NodeRuntime extends EventEmitter {
   private async ensurePMDRunning(port: number): Promise<void> {
     // Try to connect to existing PMD
     const testSocket = net.createConnection({ host: 'localhost', port });
-    
+
     return new Promise((resolve, reject) => {
       testSocket.on('connect', () => {
         testSocket.end();
@@ -155,7 +158,7 @@ export class NodeRuntime extends EventEmitter {
 
       testSocket.on('error', async () => {
         // PMD not running, start it
-        console.log('Starting PMD...');
+        logger.info('Starting PMD...');
         try {
           await this.startPMD(port);
           resolve();
@@ -226,7 +229,7 @@ export class NodeRuntime extends EventEmitter {
       try {
         await this.pmdClient.heartbeat(this.nodeId);
       } catch (err) {
-        console.error('Heartbeat failed:', err);
+        logger.error('Heartbeat failed:', new Error(JSON.stringify(err)));
       }
     }, 1000); // Every 1 second (1/3 of PMD TTL for safety margin)
   }
@@ -241,7 +244,7 @@ export class NodeRuntime extends EventEmitter {
 
     const hash = crypto.createHash('sha256');
     hash.update(`${machineId}-${pid}-${random}`);
-    
+
     return hash.digest('hex').substring(0, 16);
   }
 
@@ -255,7 +258,7 @@ export class NodeRuntime extends EventEmitter {
 
     // Resolve target (could be alias or nodeId)
     let nodeInfo: NodeInfo;
-    
+
     try {
       nodeInfo = await this.pmdClient.resolve(target);
     } catch (err) {
@@ -318,16 +321,25 @@ export class NodeRuntime extends EventEmitter {
       return;
     }
 
-    // Stop heartbeat
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-    }
-
-    // Unregister from PMD
+    // Unregister from PMD BEFORE stopping heartbeat
+    // This ensures the node is still considered "alive" when we unregister
     try {
       await this.pmdClient.unregister(this.nodeId);
-    } catch (err) {
-      console.error('Failed to unregister:', err);
+    } catch (err: any) {
+      // If the node was already removed by PMD cleanup (e.g., due to missed heartbeats),
+      // or if the PMD connection is already closed, this is not a critical error
+      if (err.message === 'Node not found') {
+        logger.warn('Node was already removed from PMD registry (likely due to cleanup)');
+      } else if (err.message === 'Not connected to PMD') {
+        logger.warn('PMD connection already closed (PMD may have shut down)');
+      } else {
+        logger.error('Failed to unregister:', err);
+      }
+    }
+
+    // Stop heartbeat after unregistering
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
     }
 
     // Disconnect from PMD
