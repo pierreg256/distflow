@@ -1,4 +1,9 @@
 // src/json-crdt.ts
+import { EventEmitter } from 'events';
+import { getLogger } from './logger';
+
+const logger = getLogger('json-crdt');
+
 export type ReplicaId = string;
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -20,7 +25,41 @@ export interface Hlc {
   r: ReplicaId;   // replica id
 }
 
-export type OpKind = "set" | "del";
+export type OpKind = "set" | "del" | "tombstone";
+
+export interface Op {
+  id: string;        // unique op id (stable)
+  kind: OpKind;
+  path: Path;
+  value?: JsonValue; // for "set"
+  hlc: Hlc;          // total order for LWW
+  deps: VectorClock; // causal dependencies (vector clock)
+  src: ReplicaId;    // source replica
+}
+
+/**
+ * Snapshot pour persistence
+ */
+export interface CrdtSnapshot {
+  doc: JsonValue;
+  vc: VectorClock;
+  hlc: Hlc;
+  lww: Array<[string, Hlc]>;
+  tombstones: Array<[string, Hlc]>;
+  replicaId: ReplicaId;
+}
+
+/**
+ * Configuration options for CRDT
+ */
+export interface CrdtOptions {
+  maxLogSize?: number;          // Max size before GC (default: 1000)
+  maxPendingSize?: number;      // Max pending buffer (default: 10000)
+  maxLwwSize?: number;          // Max LWW map size (default: 100000)
+  pendingTimeoutMs?: number;    // Timeout for pending ops (default: 60000)
+  tombstoneGracePeriodMs?: number; // Tombstone retention (default: 3600000)
+  enableAutoGc?: boolean;       // Auto GC on operations (default: true)
+}
 
 export interface Op {
   id: string;        // unique op id (stable)
@@ -133,11 +172,11 @@ function delAtPath(doc: JsonValue, path: Path): JsonValue {
 
 /**
  * JSON CRDT (LWW per-path) + causal delivery using vector clock.
- * - local ops create Op with deps = current VC (after tick at src)
- * - remote ops are applied when causally ready
+ * Enhanced with: GC, tombstones, snapshots, events
  */
-export class JSONCrdt {
+export class JSONCrdt extends EventEmitter {
   private readonly replica: ReplicaId;
+  private readonly options: Required<CrdtOptions>;
 
   private doc: JsonValue;
   private vc: VectorClock;
@@ -147,21 +186,40 @@ export class JSONCrdt {
   // LWW index: pathKey -> winning HLC
   private lww: Map<string, Hlc>;
 
+  // Tombstones: pathKey -> deletion HLC
+  private tombstones: Map<string, Hlc>;
+
   // log for delta sync
   private log: Op[];
 
   // pending ops (not causally ready)
-  private pending: Op[];
+  private pending: Array<{ op: Op; receivedAt: number }>;
 
-  constructor(replica: ReplicaId, initial: JsonValue = {}) {
+  constructor(replica: ReplicaId, initial: JsonValue = {}, options: CrdtOptions = {}) {
+    super();
     this.replica = replica;
+    this.options = {
+      maxLogSize: options.maxLogSize ?? 1000,
+      maxPendingSize: options.maxPendingSize ?? 10000,
+      maxLwwSize: options.maxLwwSize ?? 100000,
+      pendingTimeoutMs: options.pendingTimeoutMs ?? 60000,
+      tombstoneGracePeriodMs: options.tombstoneGracePeriodMs ?? 3600000,
+      enableAutoGc: options.enableAutoGc ?? true
+    };
+
     this.doc = cloneJson(initial);
     this.vc = {};
     this.hlc = { t: Date.now(), c: 0, r: replica };
     this.seq = 0;
     this.lww = new Map();
+    this.tombstones = new Map();
     this.log = [];
     this.pending = [];
+
+    logger.debug('CRDT initialized', {
+      replicaId: this.replica.substring(0, 8),
+      options: this.options
+    });
   }
 
   /** Read current document snapshot */
@@ -174,17 +232,48 @@ export class JSONCrdt {
     return { ...this.vc };
   }
 
+  /** Get replica ID */
+  getReplicaId(): ReplicaId {
+    return this.replica;
+  }
+
   /** Create and apply local SET */
   set(path: Path, value: JsonValue): Op {
+    // Check for parent/child conflicts
+    this.checkPathConflicts(path, 'set');
+
     const op = this.makeLocalOp("set", path, value);
     this.applyOp(op);
+
+    if (this.options.enableAutoGc) {
+      this.autoGc();
+    }
+
+    this.emit('change', {
+      type: 'set',
+      path,
+      value,
+      op
+    });
+
     return op;
   }
 
   /** Create and apply local DELETE */
   del(path: Path): Op {
-    const op = this.makeLocalOp("del", path);
+    const op = this.makeLocalOp("tombstone", path);
     this.applyOp(op);
+
+    if (this.options.enableAutoGc) {
+      this.autoGc();
+    }
+
+    this.emit('change', {
+      type: 'del',
+      path,
+      op
+    });
+
     return op;
   }
 
@@ -192,8 +281,17 @@ export class JSONCrdt {
   receive(op: Op): boolean {
     if (this.seen(op)) return false;
 
+    // Check pending buffer size
+    if (this.pending.length >= this.options.maxPendingSize) {
+      logger.warn('Pending buffer full, dropping old ops', {
+        pendingSize: this.pending.length,
+        maxSize: this.options.maxPendingSize
+      });
+      this.cleanPendingBuffer();
+    }
+
     if (!isCausallyReady(this.vc, op)) {
-      this.pending.push(op);
+      this.pending.push({ op, receivedAt: Date.now() });
       return false;
     }
 
@@ -208,27 +306,187 @@ export class JSONCrdt {
   diffSince(since: VectorClock): Op[] {
     return this.log.filter(op => {
       const s = since[op.src] ?? 0;
-      const v = op.deps[op.src] ?? 0; // this op's sequence on src
+      const v = op.deps[op.src] ?? 0;
       return v > s;
     });
   }
 
-  /** (Optional) manual pending drain */
+  /** Manual pending drain */
   drainPending(): void {
     let progressed = true;
     while (progressed) {
       progressed = false;
-      const rest: Op[] = [];
-      for (const op of this.pending) {
-        if (this.seen(op)) continue;
-        if (isCausallyReady(this.vc, op)) {
-          this.applyOp(op);
+      const rest: Array<{ op: Op; receivedAt: number }> = [];
+      for (const item of this.pending) {
+        if (this.seen(item.op)) continue;
+        if (isCausallyReady(this.vc, item.op)) {
+          this.applyOp(item.op);
           progressed = true;
         } else {
-          rest.push(op);
+          rest.push(item);
         }
       }
       this.pending = rest;
+    }
+  }
+
+  /** Garbage collect log */
+  gcLog(keepLastN?: number): void {
+    const keep = keepLastN ?? this.options.maxLogSize;
+    if (this.log.length <= keep) return;
+
+    const removed = this.log.length - keep;
+    this.log = this.log.slice(-keep);
+
+    logger.debug('Log GC performed', {
+      removedOps: removed,
+      logSize: this.log.length
+    });
+
+    this.emit('gc', {
+      type: 'log',
+      removed,
+      currentSize: this.log.length
+    });
+  }
+
+  /** Clean pending buffer of old/impossible ops */
+  cleanPendingBuffer(): void {
+    const now = Date.now();
+    const timeout = this.options.pendingTimeoutMs;
+
+    const before = this.pending.length;
+    this.pending = this.pending.filter(item => {
+      return now - item.receivedAt < timeout;
+    });
+
+    const removed = before - this.pending.length;
+    if (removed > 0) {
+      logger.warn('Cleaned pending buffer', {
+        removedOps: removed,
+        pendingSize: this.pending.length
+      });
+
+      this.emit('gc', {
+        type: 'pending',
+        removed,
+        currentSize: this.pending.length
+      });
+    }
+  }
+
+  /** Clean old tombstones */
+  gcTombstones(): void {
+    const now = Date.now();
+    const gracePeriod = this.options.tombstoneGracePeriodMs;
+
+    const toDelete: string[] = [];
+
+    for (const [key, hlc] of this.tombstones.entries()) {
+      if (now - hlc.t > gracePeriod) {
+        toDelete.push(key);
+      }
+    }
+
+    toDelete.forEach(key => this.tombstones.delete(key));
+
+    if (toDelete.length > 0) {
+      logger.debug('Tombstone GC performed', {
+        removedTombstones: toDelete.length,
+        tombstonesSize: this.tombstones.size
+      });
+
+      this.emit('gc', {
+        type: 'tombstones',
+        removed: toDelete.length,
+        currentSize: this.tombstones.size
+      });
+    }
+  }
+
+  /** Auto GC triggered after operations */
+  private autoGc(): void {
+    // GC log if too large
+    if (this.log.length > this.options.maxLogSize * 2) {
+      this.gcLog();
+    }
+
+    // Check LWW map size
+    if (this.lww.size > this.options.maxLwwSize) {
+      logger.warn('LWW map size exceeded limit', {
+        lwwSize: this.lww.size,
+        maxSize: this.options.maxLwwSize
+      });
+    }
+
+    // Clean pending periodically
+    if (this.pending.length > this.options.maxPendingSize / 2) {
+      this.cleanPendingBuffer();
+    }
+
+    // GC old tombstones
+    this.gcTombstones();
+  }
+
+  /** Create snapshot for persistence */
+  snapshot(): CrdtSnapshot {
+    return {
+      doc: cloneJson(this.doc),
+      vc: { ...this.vc },
+      hlc: { ...this.hlc },
+      lww: Array.from(this.lww.entries()),
+      tombstones: Array.from(this.tombstones.entries()),
+      replicaId: this.replica
+    };
+  }
+
+  /** Restore from snapshot */
+  restore(snap: CrdtSnapshot): void {
+    if (snap.replicaId !== this.replica) {
+      logger.warn('Restoring snapshot from different replica', {
+        currentReplica: this.replica.substring(0, 8),
+        snapshotReplica: snap.replicaId.substring(0, 8)
+      });
+    }
+
+    this.doc = cloneJson(snap.doc);
+    this.vc = { ...snap.vc };
+    this.hlc = { ...snap.hlc };
+    this.lww = new Map(snap.lww);
+    this.tombstones = new Map(snap.tombstones);
+    this.log = []; // Clear log after restore
+    this.pending = [];
+
+    logger.info('Snapshot restored', {
+      vcSize: Object.keys(this.vc).length,
+      lwwSize: this.lww.size,
+      tombstonesSize: this.tombstones.size
+    });
+
+    this.emit('restore', { snapshot: snap });
+  }
+
+  /** Check for path conflicts (parent/child) */
+  private checkPathConflicts(path: Path, operation: 'set' | 'del'): void {
+    // Check if any parent is a tombstone
+    for (let i = 0; i < path.length; i++) {
+      const parentPath = path.slice(0, i + 1);
+      const parentKey = this.pathKey(parentPath);
+
+      if (this.tombstones.has(parentKey)) {
+        logger.warn('Path conflict detected: parent is tombstone', {
+          path,
+          parentPath,
+          operation
+        });
+
+        this.emit('conflict', {
+          type: 'parent-tombstone',
+          path,
+          parentPath,
+          operation
+        });
+      }
     }
   }
 
@@ -240,6 +498,23 @@ export class JSONCrdt {
   /** Deserialize op */
   static decodeOp(s: string): Op {
     return JSON.parse(s) as Op;
+  }
+
+  /** Get statistics */
+  getStats(): {
+    logSize: number;
+    pendingSize: number;
+    lwwSize: number;
+    tombstonesSize: number;
+    vcSize: number;
+  } {
+    return {
+      logSize: this.log.length,
+      pendingSize: this.pending.length,
+      lwwSize: this.lww.size,
+      tombstonesSize: this.tombstones.size,
+      vcSize: Object.keys(this.vc).length
+    };
   }
 
   // ---- internals ----
@@ -285,15 +560,50 @@ export class JSONCrdt {
   }
 
   private applyOp(op: Op): void {
-    // LWW per path
     const key = this.pathKey(op.path);
-    const current = this.lww.get(key);
 
-    if (!current || compareHlc(op.hlc, current) > 0) {
-      this.lww.set(key, op.hlc);
-      this.doc = op.kind === "set"
-        ? setAtPath(this.doc, op.path, op.value!)
-        : delAtPath(this.doc, op.path);
+    // Handle tombstones
+    if (op.kind === "tombstone") {
+      const currentTombstone = this.tombstones.get(key);
+
+      if (!currentTombstone || compareHlc(op.hlc, currentTombstone) > 0) {
+        this.tombstones.set(key, op.hlc);
+        this.doc = delAtPath(this.doc, op.path);
+
+        logger.debug('Tombstone applied', {
+          path: op.path,
+          hlc: op.hlc
+        });
+      }
+    } else {
+      // Check if there's a tombstone that's newer
+      const tombstone = this.tombstones.get(key);
+      if (tombstone && compareHlc(tombstone, op.hlc) > 0) {
+        logger.warn('SET rejected: newer tombstone exists', {
+          path: op.path,
+          setHlc: op.hlc,
+          tombstoneHlc: tombstone
+        });
+
+        this.emit('conflict', {
+          type: 'tombstone-wins',
+          path: op.path,
+          opHlc: op.hlc,
+          tombstoneHlc: tombstone
+        });
+
+        // Still record in log but don't apply
+      } else {
+        // LWW per path
+        const current = this.lww.get(key);
+
+        if (!current || compareHlc(op.hlc, current) > 0) {
+          this.lww.set(key, op.hlc);
+          this.doc = op.kind === "set"
+            ? setAtPath(this.doc, op.path, op.value!)
+            : delAtPath(this.doc, op.path);
+        }
+      }
     }
 
     // merge VC: set local[src] = max(local[src], op.deps[src]) etc.
@@ -305,7 +615,6 @@ export class JSONCrdt {
     this.log.push(op);
 
     // merge remote HLC into local HLC (HLC receive rule simplified)
-    // keep monotonic: hlc.t = max(local.t, op.t), hlc.c = ...
     const t = Math.max(this.hlc.t, op.hlc.t);
     const c =
       t === this.hlc.t && t === op.hlc.t ? Math.max(this.hlc.c, op.hlc.c) + 1
