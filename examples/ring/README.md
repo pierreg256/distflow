@@ -14,6 +14,42 @@ Cet exemple démontre une implémentation complète d'une topologie en anneau (r
 
 ## Architecture
 
+### Front-End Load Balancer
+
+```mermaid
+graph TD
+    Client[Browser<br/>Dashboard] -->|HTTP| Front[Front-End Server<br/>:3000]
+    Front -->|fork| N1[ring-1<br/>:9100]
+    Front -->|fork| N2[ring-2<br/>:9101]
+    Front -->|fork| N3[ring-3<br/>:9102]
+    Front -.->|round-robin<br/>/proxy/*| N1
+    Front -.->|round-robin<br/>/proxy/*| N2
+    Front -.->|round-robin<br/>/proxy/*| N3
+    
+    style Front fill:#6264A7,stroke:#8b8cc7,stroke-width:3px,color:#fff
+    classDef default fill:#2d2c2c,stroke:#3b3a39,color:#fff
+```
+
+Le front-end :
+
+- **Spawne** les nœuds du ring en tant que processus enfants (`child_process.fork`)
+- **Dashboard** : sert une page web unifiée avec statut de tous les nœuds
+- **Load balancing** : les requêtes vers `/proxy/*` sont réparties en round-robin
+- **Gestion dynamique** : ajouter/arrêter des nœuds via le dashboard
+- **SSE** : mises à jour temps réel du statut des nœuds
+
+Routes :
+
+| Route | Méthode | Description |
+| --- | --- | --- |
+| `/` | GET | Dashboard unifié |
+| `/api/nodes` | GET | Liste des nœuds (JSON) |
+| `/api/nodes/add` | POST | Spawner un nouveau nœud |
+| `/api/nodes/stop/:alias` | POST | Arrêter un nœud |
+| `/proxy/*` | GET | Load balancer round-robin |
+| `/node/:alias/*` | GET | Accès direct à un nœud |
+| `/events` | GET | SSE live updates |
+
 ### Topologie du Ring
 
 ```mermaid
@@ -80,6 +116,22 @@ npm start ring-3 8003
 ```
 
 Le premier argument est l'alias du nœud, le second (optionnel) est le port HTTP.
+
+### Démarrage via le Front-End (recommandé)
+
+Le front-end lance automatiquement les nœuds, offre un dashboard unifié et du load balancing :
+
+```bash
+# Démarrage par défaut : 3 nœuds, dashboard sur le port 3000
+npm run front
+
+# Personnaliser le port du dashboard et le nombre de nœuds
+node front.js 3000 5
+```
+
+Le premier argument est le port du dashboard, le second le nombre de nœuds à spawner.
+
+Ouvrir <http://localhost:3000> pour accéder au dashboard.
 
 ## Interface Web
 

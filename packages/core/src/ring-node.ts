@@ -1,1257 +1,864 @@
 import crypto from 'crypto';
-import { EventEmitter } from 'events';
-import { NodeRuntime, NodeRuntimeOptions } from './node-runtime';
-import { JSONCrdt, CrdtOptions } from './json-crdt';
-import { MessageMetadata } from './mailbox';
-import { configureLogger, getLogger, LogLevel,  } from './logger';
+import * as Y from 'yjs';
+import { NodeRuntime, NodeRuntimeOptions, PeerInfo } from './node-runtime';
+import { configureLogger, LogLevel } from './logger';
 
 const logger = configureLogger({ name: 'ring-node', level: LogLevel.INFO });
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
 /**
- * Compute consistent hash for a node identifier
- * Uses SHA-256 and returns first 8 bytes as a number
+ * Compute consistent hash for a node identifier.
+ * Uses SHA-256, returns first 8 bytes as a JS safe integer.
  */
 export function consistentHash(nodeId: string): number {
   const hash = crypto.createHash('sha256').update(nodeId).digest();
-  // Use first 8 bytes as a 64-bit number (well, 53-bit safe integer in JS)
   return hash.readUInt32BE(0) * 0x100000000 + hash.readUInt32BE(4);
 }
 
+/** Encode Uint8Array to base64 string (transport-safe) */
+function encodeUpdate(update: Uint8Array): string {
+  return Buffer.from(update).toString('base64');
+}
+
+/** Decode base64 string to Uint8Array */
+function decodeUpdate(encoded: string): Uint8Array {
+  return new Uint8Array(Buffer.from(encoded, 'base64'));
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────────────
+
 /**
- * Ring member information
+ * Ring state machine states.
+ *
+ *   BOOTSTRAPPING  → join → UNSTABLE
+ *   UNSTABLE       → (quiescence + quorum convergence) → STABLE
+ *   STABLE         → (awareness change | doc update)   → UNSTABLE
  */
-export interface RingMember {
-  alias: string;
+export enum RingState {
+  /** Startup phase – no reliable view of the ring yet */
+  BOOTSTRAPPING = 'BOOTSTRAPPING',
+  /** Topology is changing (join / leave / rebalance) */
+  UNSTABLE = 'UNSTABLE',
+  /** Topology is frozen – routing is authorised */
+  STABLE = 'STABLE',
+}
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+/** Volatile awareness payload (heartbeat) */
+export interface AwarenessEntry {
   nodeId: string;
+  heartbeatTs: number;
+}
+
+/** Persisted ring member inside the Yjs document */
+export interface RingMember {
+  nodeId: string;
+  alias?: string;
+  token: number; // consistentHash(nodeId)
   joinedAt: number;
-  hash: number;
 }
 
-/**
- * Ring state stored in CRDT
- */
-export interface RingState {
-  members: Record<string, Omit<RingMember, 'hash'>>;
-  token: {
-    round: number;
-    completedAt: number;
-    completedBy: string;
-  } | null;
-}
-
-/**
- * Ring neighbors
- */
+/** Neighbours on the ring (predecessor / successor) */
 export interface RingNeighbors {
-  successor: RingMember | null;
   predecessor: RingMember | null;
-  successorList: RingMember[]; // List of R successors for fault tolerance
-  ring: RingMember[];
+  successor: RingMember | null;
 }
 
-/**
- * Stability information
- */
-export interface RingStabilityInfo {
-  isStable: boolean;
-  memberCount: number;
-  replicationFactor: number;
-  lastTopologyChangeMs: number;
-  timeSinceLastChangeMs: number;
-  requiredStableTimeMs: number;
+/** Ring-specific protocol messages exchanged between RingNodes */
+export type RingMessage =
+  | { type: 'ring:update'; update: string }
+  | { type: 'ring:awareness'; nodeId: string; entry: AwarenessEntry | null }
+  | { type: 'ring:sync-step1'; sv: string }
+  | { type: 'ring:sync-step2'; sv: string; update: string };
+
+/** Configuration options for a RingNode */
+export interface RingNodeOptions extends NodeRuntimeOptions {
+  /** Heartbeat broadcast interval (ms) – default 5 000 */
+  heartbeatInterval?: number;
+  /** Awareness timeout before a peer is considered offline (ms) – default 30 000 */
+  awarenessTimeout?: number;
+  /** Duration of quiescence required before considering the ring stable (ms) – default 15 000 */
+  stabilityWindow?: number;
+  /** Fraction of online peers that must have converged – default 0.6 */
+  quorumRatio?: number;
+  /** Stability-detection tick interval (ms) – default 1 000 */
+  stabilityCheckInterval?: number;
 }
 
-/**
- * Options for RingNode
- */
-export interface RingNodeOptions {
-  alias: string;
-  syncIntervalMs?: number;
-  displayIntervalMs?: number;
-  metricsIntervalMs?: number;
-  stabilizeIntervalMs?: number;
-  successorListSize?: number; // Number of successors to maintain (default: 3)
-  replicationFactor?: number; // Number of replicas/minimum nodes for stability (default: 3)
-  stabilityCheckIntervalMs?: number; // How often to check for stability (default: 1000)
-  requiredStableTimeMs?: number; // Time without changes to be considered stable (default: 5000)
-  nodeRuntimeOptions?: Partial<NodeRuntimeOptions>;
-  crdtOptions?: CrdtOptions;
-}
+// ─── Default constants ──────────────────────────────────────────────────────
+
+const HEARTBEAT_INTERVAL = 5_000;
+const AWARENESS_TIMEOUT = 30_000;
+const STABILITY_WINDOW = 15_000;
+const QUORUM_RATIO = 0.6;
+const STABILITY_CHECK_INTERVAL = 1_000;
+
+// ─── Lightweight Awareness implementation ───────────────────────────────────
+
+import { EventEmitter } from 'events';
 
 /**
- * Ring Node - maintains a ring topology with dynamic membership using CRDT
- * Nodes are ordered by consistent hash of their nodeId
+ * Minimal Awareness layer (mirrors the Yjs awareness protocol concepts).
+ * Each node publishes its local state; remote states are set externally
+ * (e.g. via long-polling sync or transport messages).
  */
-export class RingNode {
-  protected alias: string;
-  protected node: NodeRuntime | null = null;
-  protected crdt: JSONCrdt | null = null;
-  protected syncInterval: NodeJS.Timeout | null = null;
-  protected displayInterval: NodeJS.Timeout | null = null;
-  protected metricsInterval: NodeJS.Timeout | null = null;
-  protected stabilizeInterval: NodeJS.Timeout | null = null;
-  protected stabilityCheckInterval: NodeJS.Timeout | null = null;
-  protected syncIntervalMs: number;
-  protected displayIntervalMs: number;
-  protected metricsIntervalMs: number;
-  protected stabilizeIntervalMs: number;
-  protected stabilityCheckIntervalMs: number;
-  protected requiredStableTimeMs: number;
-  protected successorListSize: number;
-  protected replicationFactor: number;
+export class Awareness extends EventEmitter {
+  private states: Map<string, AwarenessEntry | null> = new Map();
+  private timeoutMs: number;
 
-  // Stability tracking
-  protected events: EventEmitter = new EventEmitter();
-  protected lastTopologyChange: number = Date.now();
-  protected previousMemberCount: number = 0;
-  protected currentlyStable: boolean = false;
-  protected nodeRuntimeOptions: Partial<NodeRuntimeOptions>;
-  protected crdtOptions: CrdtOptions;
-
-  // DHT storage: key -> value
-  protected storage: Map<string, any> = new Map();
-
-  // Pending requests for async request/response pattern
-  protected pendingRequests: Map<string, {
-    resolve: (value: any) => void;
-    reject: (error: Error) => void;
-    timeout: NodeJS.Timeout;
-  }> = new Map();
-  protected requestIdCounter = 0;
-
-  constructor(options: RingNodeOptions) {
-    this.alias = options.alias;
-    this.syncIntervalMs = options.syncIntervalMs ?? 2000;
-    this.displayIntervalMs = options.displayIntervalMs ?? 5000;
-    this.metricsIntervalMs = options.metricsIntervalMs ?? 10000;
-    this.stabilizeIntervalMs = options.stabilizeIntervalMs ?? 10000;
-    this.stabilityCheckIntervalMs = options.stabilityCheckIntervalMs ?? 1000;
-    this.requiredStableTimeMs = options.requiredStableTimeMs ?? 5000;
-    this.successorListSize = options.successorListSize ?? 3;
-    this.replicationFactor = options.replicationFactor ?? 3;
-    this.nodeRuntimeOptions = options.nodeRuntimeOptions ?? {
-      mailbox: {
-        maxSize: 100,
-        overflow: 'drop-newest'
-      }
-    };
-    this.crdtOptions = options.crdtOptions ?? {
-      maxLogSize: 500,
-      maxPendingSize: 1000,
-      enableAutoGc: true,
-      tombstoneGracePeriodMs: 3600000
-    };
+  constructor(timeoutMs: number = AWARENESS_TIMEOUT) {
+    super();
+    this.timeoutMs = timeoutMs;
   }
 
-  async start(): Promise<void> {
-    const logger = getLogger('start');
-    logger.info('Starting ring node', { alias: this.alias });
+  /** Set the local awareness state (null = offline / leaving) */
+  setLocalState(nodeId: string, state: AwarenessEntry | null): void {
+    this.states.set(nodeId, state);
+    this.emit('change', {
+      added: [],
+      updated: [nodeId],
+      removed: state === null ? [nodeId] : [],
+    });
+    if (state === null) {
+      this.states.delete(nodeId);
+    }
+  }
 
-    // Start the node runtime
-    this.node = await NodeRuntime.start({
-      alias: this.alias,
-      ...this.nodeRuntimeOptions
+  /** Apply a remote awareness state (received from the network) */
+  setRemoteState(nodeId: string, state: AwarenessEntry | null): void {
+    if (state === null) {
+      if (this.states.has(nodeId)) {
+        this.states.delete(nodeId);
+        this.emit('change', { added: [], updated: [], removed: [nodeId] });
+      }
+      return;
+    }
+    const isNew = !this.states.has(nodeId);
+    this.states.set(nodeId, state);
+    this.emit('change', {
+      added: isNew ? [nodeId] : [],
+      updated: isNew ? [] : [nodeId],
+      removed: [],
+    });
+  }
+
+  /** Get awareness state for a single node */
+  getState(nodeId: string): AwarenessEntry | null {
+    return this.states.get(nodeId) ?? null;
+  }
+
+  /** Return all online peers (those whose heartbeat is still fresh) */
+  getOnlinePeers(now: number = Date.now()): AwarenessEntry[] {
+    const online: AwarenessEntry[] = [];
+    for (const [, entry] of this.states) {
+      if (entry && now - entry.heartbeatTs < this.timeoutMs) {
+        online.push(entry);
+      }
+    }
+    return online;
+  }
+
+  /** Return peers whose heartbeat has expired */
+  getOfflinePeers(now: number = Date.now()): string[] {
+    const offline: string[] = [];
+    for (const [id, entry] of this.states) {
+      if (entry && now - entry.heartbeatTs >= this.timeoutMs) {
+        offline.push(id);
+      }
+    }
+    return offline;
+  }
+
+  /** Cleanup expired awareness entries and emit removals */
+  cleanup(now: number = Date.now()): string[] {
+    const removed: string[] = [];
+    for (const [id, entry] of this.states) {
+      if (entry && now - entry.heartbeatTs >= this.timeoutMs) {
+        this.states.delete(id);
+        removed.push(id);
+      }
+    }
+    if (removed.length > 0) {
+      this.emit('change', { added: [], updated: [], removed });
+    }
+    return removed;
+  }
+
+  destroy(): void {
+    this.states.clear();
+    this.removeAllListeners();
+  }
+}
+
+// ─── RingNode ───────────────────────────────────────────────────────────────
+
+/**
+ * RingNode – Consistent-hash ring built on top of NodeRuntime.
+ *
+ * Inherits from NodeRuntime for:
+ *  - PMD-based peer discovery (peer:join / peer:leave events)
+ *  - TCP transport (send / broadcast to peers)
+ *  - Mailbox-based message handling
+ *
+ * Adds:
+ *  - Yjs CRDT document as the persistent ring topology
+ *  - Awareness heartbeats for online/offline detection
+ *  - A three-state machine (BOOTSTRAPPING → UNSTABLE → STABLE)
+ *  - Leaderless quorum convergence based on quiescence + CRDT diff
+ *
+ * Events emitted (in addition to NodeRuntime events):
+ *  - `state-change`       (newState, oldState)
+ *  - `ring-stable`        (sortedMembers[])
+ *  - `ring-unstable`      ()
+ *  - `member-joined`      (RingMember)
+ *  - `member-left`        (nodeId)
+ *  - `awareness-change`   ({ added, updated, removed })
+ */
+export class RingNode extends NodeRuntime {
+  // ── ring configuration ─────────────────────────────────────────────────
+  private readonly heartbeatInterval: number;
+  private readonly awarenessTimeout: number;
+  private readonly stabilityWindow: number;
+  private readonly quorumRatio: number;
+  private readonly stabilityCheckInterval: number;
+
+  // ── state machine ─────────────────────────────────────────────────────
+  private _ringState: RingState = RingState.BOOTSTRAPPING;
+  private lastTopologyChangeTs: number = Date.now();
+  private lastAwarenessChangeTs: number = Date.now();
+
+  // ── CRDT (Yjs) ────────────────────────────────────────────────────────
+  readonly ydoc: Y.Doc;
+  private ringArray: Y.Array<RingMember>;
+
+  // ── Awareness ─────────────────────────────────────────────────────────
+  readonly awareness: Awareness;
+
+  // ── timers ────────────────────────────────────────────────────────────
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private stabilityTimer?: ReturnType<typeof setInterval>;
+
+  // ── known peers (cache updated via PMD events) ────────────────────────
+  private knownPeers: Map<string, PeerInfo> = new Map();
+
+  // ── lifecycle ─────────────────────────────────────────────────────────
+  private ringDestroyed = false;
+
+  // ────────────────────────────────────────────────────────────────────────
+
+  protected constructor(options: RingNodeOptions = {}) {
+    super(options);
+
+    this.heartbeatInterval = options.heartbeatInterval ?? HEARTBEAT_INTERVAL;
+    this.awarenessTimeout = options.awarenessTimeout ?? AWARENESS_TIMEOUT;
+    this.stabilityWindow = options.stabilityWindow ?? STABILITY_WINDOW;
+    this.quorumRatio = options.quorumRatio ?? QUORUM_RATIO;
+    this.stabilityCheckInterval =
+      options.stabilityCheckInterval ?? STABILITY_CHECK_INTERVAL;
+
+    // ── Yjs doc ─────────────────────────────────────────────────────────
+    this.ydoc = new Y.Doc();
+    this.ringArray = this.ydoc.getArray<RingMember>('ring');
+
+    // ── Awareness ───────────────────────────────────────────────────────
+    this.awareness = new Awareness(this.awarenessTimeout);
+
+    // ── Wire doc & awareness to the state machine ───────────────────────
+    this.ydoc.on('update', this.onDocUpdate);
+    this.awareness.on('change', this.onAwarenessChange);
+  }
+
+  // ─── Factory ──────────────────────────────────────────────────────────
+
+  /**
+   * Create a RingNode, initialise the NodeRuntime (PMD + transport),
+   * then join the ring.
+   */
+  static async start(options: RingNodeOptions = {}): Promise<RingNode> {
+    // Honour singleton constraint from NodeRuntime
+    if (NodeRuntime['instance']) {
+      throw new Error(
+        'A NodeRuntime (or RingNode) is already running in this process',
+      );
+    }
+
+    const node = new RingNode(options);
+
+    // NodeRuntime initialisation: PMD, transport, register, watch
+    await (node as any).initialize(options.pmdPort ?? 4369);
+
+    // Mark singleton
+    (NodeRuntime as any).instance = node;
+
+    // Wire PMD peer events → ring
+    node.wirePeerDiscovery();
+
+    // Wire incoming transport messages → ring protocol
+    node.wireIncomingMessages();
+
+    // Discover existing peers FIRST (populate knownPeers before joinRing
+    // so that the Yjs update broadcast in onDocUpdate reaches them)
+    await node.discoverExistingPeers();
+
+    // Join the ring (insert into CRDT, start heartbeat + stability loop)
+    // The onDocUpdate handler will broadcast the insert to knownPeers.
+    node.joinRing();
+
+    // Kick off a full bidirectional sync with every known peer
+    await node.syncWithExistingPeers();
+
+    return node;
+  }
+
+  // ─── Public getters ───────────────────────────────────────────────────
+
+  /** Current state-machine state */
+  get ringState(): RingState {
+    return this._ringState;
+  }
+
+  /** Sorted snapshot of current ring members */
+  get members(): RingMember[] {
+    return this.getSortedMembers();
+  }
+
+  /** Number of members in the ring */
+  get size(): number {
+    return this.ringArray.length;
+  }
+
+  // ─── Lifecycle ────────────────────────────────────────────────────────
+
+  /**
+   * Insert local node into the CRDT, start heartbeat and stability loops.
+   */
+  private joinRing(): void {
+    logger.info('Joining ring', { nodeId: this.nodeId });
+
+    // Insert self into the CRDT if not already present
+    this.ydoc.transact(() => {
+      if (!this.ringContains(this.nodeId)) {
+        this.ringArray.push([
+          {
+            nodeId: this.nodeId,
+            alias: this.alias || undefined,
+            token: consistentHash(this.nodeId),
+            joinedAt: Date.now(),
+          },
+        ]);
+      }
     });
 
-    // Initialize CRDT with this node's ID and options
-    this.crdt = new JSONCrdt(
-      this.node.getNodeId(),
-      { members: {}, token: null },
-      this.crdtOptions
+    // Publish initial awareness
+    this.awareness.setLocalState(this.nodeId, {
+      nodeId: this.nodeId,
+      heartbeatTs: Date.now(),
+    });
+
+    // Start heartbeat loop (+ broadcast awareness to peers)
+    this.heartbeatTimer = setInterval(() => {
+      const entry: AwarenessEntry = {
+        nodeId: this.nodeId,
+        heartbeatTs: Date.now(),
+      };
+      this.awareness.setLocalState(this.nodeId, entry);
+      this.broadcastRingMessage({ type: 'ring:awareness', nodeId: this.nodeId, entry });
+    }, this.heartbeatInterval);
+
+    // Start stability detection loop
+    this.stabilityTimer = setInterval(
+      () => this.stabilityCheck(),
+      this.stabilityCheckInterval,
     );
 
-    // Setup CRDT event listeners
-    this.setupCrdtEventListeners();
-
-    // Add self to the ring
-    this.addSelfToRing();
-
-    // Listen for peer join/leave events
-    this.node.on('peer:join', async (peer) => {
-      logger.info('Peer joined', { alias: this.alias, peer: peer.alias || peer.nodeId });
-      // No immediate action - will be added via CRDT sync
-    });
-
-    this.node.on('peer:leave', async (peer) => {
-      logger.info('Peer left', { alias: this.alias, peer: peer.alias || peer.nodeId });
-      // Remove from CRDT
-      this.removeMemberFromRing(peer.nodeId);
-    });
-
-    // Listen for messages
-    this.node.onMessage((message, meta) => {
-      this.handleMessage(message, meta);
-    });
-
-    // Start periodic CRDT sync
-    this.startCrdtSync();
-
-    // Periodically display ring structure
-    if (this.displayIntervalMs > 0) {
-      this.displayInterval = setInterval(() => {
-        this.displayRingStatus();
-      }, this.displayIntervalMs);
-    }
-
-    // Periodically display CRDT metrics
-    if (this.metricsIntervalMs > 0) {
-      this.metricsInterval = setInterval(() => {
-        this.displayCrdtMetrics();
-      }, this.metricsIntervalMs);
-    }
-
-    // Start periodic stabilization
-    if (this.stabilizeIntervalMs > 0) {
-      this.stabilizeInterval = setInterval(() => {
-        this.stabilize();
-      }, this.stabilizeIntervalMs);
-    }
-
-    // Start stability checking
-    this.startStabilityCheck();
+    // Transition BOOTSTRAPPING → UNSTABLE
+    this.setRingState(RingState.UNSTABLE);
   }
 
   /**
-   * Setup CRDT event listeners for observability
+   * Gracefully leave the ring (announce offline, remove from CRDT).
    */
-  protected setupCrdtEventListeners(): void {
-    if (!this.crdt) return;
+  leaveRing(): void {
+    logger.info('Leaving ring', { nodeId: this.nodeId });
 
-    // Listen for state changes
-    this.crdt.on('change', ({ type, path, value }) => {
-      logger.debug('CRDT change', {
-        alias: this.alias,
-        changeType: type,
-        path: JSON.stringify(path),
-        hasValue: value !== undefined
-      });
+    // Signal offline to local awareness + broadcast
+    this.awareness.setLocalState(this.nodeId, null);
+    this.broadcastRingMessage({
+      type: 'ring:awareness',
+      nodeId: this.nodeId,
+      entry: null,
     });
 
-    // Listen for conflicts
-    this.crdt.on('conflict', (conflict) => {
-      logger.warn('CRDT conflict detected', {
-        alias: this.alias,
-        conflictType: conflict.type,
-        path: JSON.stringify(conflict.path)
-      });
+    // Remove self from CRDT
+    this.ydoc.transact(() => {
+      this.removeNodeFromRing(this.nodeId);
     });
 
-    // Listen for GC events
-    this.crdt.on('gc', ({ type, removed, currentSize }) => {
-      logger.debug('CRDT garbage collection', {
-        alias: this.alias,
-        gcType: type,
-        removed,
-        currentSize
-      });
-    });
-
-    // Listen for restore events
-    this.crdt.on('restore', () => {
-      logger.info('CRDT snapshot restored', { alias: this.alias });
-    });
+    this.stopRingTimers();
   }
 
   /**
-   * Add self to the CRDT ring state
+   * Full teardown: leave the ring, then shut down the underlying NodeRuntime.
    */
-  protected addSelfToRing(): void {
-    if (!this.node || !this.crdt) return;
+  async shutdown(): Promise<void> {
+    if (this.ringDestroyed) return;
+    this.ringDestroyed = true;
 
-    this.crdt.set(['members', this.node.getNodeId()], {
-      alias: this.alias,
-      nodeId: this.node.getNodeId(),
-      joinedAt: Date.now()
-    });
+    // Ring-level cleanup
+    this.leaveRing();
 
-    logger.info('Added self to ring', { alias: this.alias, nodeId: this.node.getNodeId().substring(0, 8) });
-    this.onTopologyChange();
+    this.ydoc.off('update', this.onDocUpdate);
+    this.awareness.off('change', this.onAwarenessChange);
+    this.awareness.destroy();
+    this.ydoc.destroy();
+
+    logger.info('RingNode destroyed', { nodeId: this.nodeId });
+
+    // NodeRuntime-level shutdown (PMD unregister, transport stop, etc.)
+    await super.shutdown();
   }
 
-  /**
-   * Remove a member from the CRDT ring state
-   */
-  protected removeMemberFromRing(nodeId: string): void {
-    if (!this.crdt) return;
+  // ─── Ring operations ──────────────────────────────────────────────────
 
-    const state = this.crdt.value() as unknown as RingState;
-    if (!state) return;
-
-    const members = state.members || {};
-
-    if (members[nodeId]) {
-      this.crdt.del(['members', nodeId]);
-      logger.info('Removed member from ring', { alias: this.alias, removedNodeId: nodeId.substring(0, 8) });
-      this.onTopologyChange();
+  /** Check whether the ring contains a given node. */
+  ringContains(nodeId: string): boolean {
+    for (let i = 0; i < this.ringArray.length; i++) {
+      if (this.ringArray.get(i).nodeId === nodeId) return true;
     }
+    return false;
   }
 
   /**
-   * Hook called when topology changes (cannot be overridden)
+   * Remove a node from the Yjs ring array.
+   * Must be called inside a `ydoc.transact()` block.
    */
-  private onTopologyChange(): void {
-    const currentMemberCount = this.getMemberCount();
-    // Only consider it a real topology change if member count changed
-    if (currentMemberCount !== this.previousMemberCount) {
-      this.lastTopologyChange = Date.now();
-      this.previousMemberCount = currentMemberCount;
-      this.events.emit('ring:topology-change', this.getStabilityInfo());
-
-      // If was stable, mark as unstable now
-      if (this.currentlyStable) {
-        this.currentlyStable = false;
-        this.events.emit('ring:unstable', this.getStabilityInfo());
-        logger.info('Ring became unstable', {
-          alias: this.alias,
-          memberCount: currentMemberCount
-        });
+  private removeNodeFromRing(nodeId: string): void {
+    for (let i = this.ringArray.length - 1; i >= 0; i--) {
+      if (this.ringArray.get(i).nodeId === nodeId) {
+        this.ringArray.delete(i, 1);
+        return;
       }
     }
-
-
   }
 
-  /**
-   * Start periodic stability check
-   */
-  protected startStabilityCheck(): void {
-    this.stabilityCheckInterval = setInterval(() => {
-      this.checkStability();
-    }, this.stabilityCheckIntervalMs);
-  }
-
-  /**
-   * Check if ring is stable and emit events if state changes
-   */
-  protected checkStability(): void {
-    const info = this.getStabilityInfo();
-
-    // Transition from unstable to stable
-    if (!this.currentlyStable && info.isStable) {
-      this.currentlyStable = true;
-      this.events.emit('ring:stable', info);
-      logger.info('Ring became stable', {
-        alias: this.alias,
-        memberCount: info.memberCount,
-        timeSinceChange: info.timeSinceLastChangeMs
-      });
+  /** Return ring members sorted by token (ascending). */
+  getSortedMembers(): RingMember[] {
+    const members: RingMember[] = [];
+    for (let i = 0; i < this.ringArray.length; i++) {
+      members.push(this.ringArray.get(i));
     }
-    // Transition from stable to unstable is handled in onTopologyChange()
+    return members.sort((a, b) => a.token - b.token);
   }
 
   /**
-   * Get current stability information
+   * Find the successor node for a given key (consistent-hash lookup).
+   * Throws if the ring is not STABLE.
    */
-  public getStabilityInfo(): RingStabilityInfo {
-    const now = Date.now();
-    const timeSinceLastChange = now - this.lastTopologyChange;
-    const memberCount = this.getMemberCount();
-    const hasEnoughNodes = memberCount >= this.replicationFactor;
-    const hasStableTime = timeSinceLastChange >= this.requiredStableTimeMs;
-    const isStable = hasEnoughNodes && hasStableTime;
-
-    return {
-      isStable,
-      memberCount,
-      replicationFactor: this.replicationFactor,
-      lastTopologyChangeMs: this.lastTopologyChange,
-      timeSinceLastChangeMs: timeSinceLastChange,
-      requiredStableTimeMs: this.requiredStableTimeMs
-    };
-  }
-
-  /**
-   * Check if ring is currently stable
-   */
-  public isStable(): boolean {
-    return this.getStabilityInfo().isStable;
-  }
-
-  /**
-   * Get number of members in the ring
-   */
-  public getMemberCount(): number {
-    if (!this.crdt) return 0;
-    const state = this.crdt.value() as unknown as RingState;
-    return Object.keys(state?.members || {}).length;
-  }
-
-  /**
-   * Subscribe to ring events
-   * Events: 'ring:stable', 'ring:unstable'
-   */
-  public on(event: string, listener: (...args: any[]) => void): this {
-    this.events.on(event, listener);
-    return this;
-  }
-
-  /**
-   * Unsubscribe from ring events
-   */
-  public off(event: string, listener: (...args: any[]) => void): this {
-    this.events.off(event, listener);
-    return this;
-  }
-
-  /**
-   * Subscribe once to ring events
-   */
-  public once(event: string, listener: (...args: any[]) => void): this {
-    this.events.once(event, listener);
-    return this;
-  }
-
-  /**
-   * Wait for ring to become stable (returns a Promise)
-   */
-  public async waitForStable(timeoutMs: number = 30000): Promise<RingStabilityInfo> {
-    // If already stable, return immediately
-    if (this.isStable()) {
-      return this.getStabilityInfo();
+  findSuccessor(key: string): RingMember {
+    if (this._ringState !== RingState.STABLE) {
+      throw new Error('Ring not stable – routing is not allowed');
     }
 
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.events.off('ring:stable', onStable);
-        reject(new Error(`Ring did not stabilize within ${timeoutMs}ms`));
-      }, timeoutMs);
+    const sorted = this.getSortedMembers();
+    if (sorted.length === 0) throw new Error('Ring is empty');
 
-      const onStable = (info: RingStabilityInfo) => {
-        clearTimeout(timeout);
-        resolve(info);
-      };
-
-      this.events.once('ring:stable', onStable);
-    });
-  }
-
-  /**
-   * Start periodic CRDT sync with peers
-   */
-  protected startCrdtSync(): void {
-    this.syncInterval = setInterval(async () => {
-      await this.syncCrdtWithPeers();
-    }, this.syncIntervalMs);
-  }
-
-  /**
-   * Sync CRDT state with all peers
-   */
-  protected async syncCrdtWithPeers(): Promise<void> {
-    if (!this.node || !this.crdt) return;
-
-    try {
-      const peers = await this.node.discover();
-      const ringPeers = peers.filter(p => p.alias && p.alias.startsWith('ring-'));
-
-      if (ringPeers.length === 0) return;
-
-      // Send our vector clock and ops to all peers
-      const clock = this.crdt.clock();
-
-      for (const peer of ringPeers) {
-        try {
-          if (peer.alias) {
-            await this.node.send(peer.alias, {
-              type: 'CRDT_SYNC_REQUEST',
-              clock: clock,
-              from: this.alias,
-              nodeId: this.node.getNodeId()
-            });
-          }
-        } catch (err) {
-          // Ignore send errors
-        }
-      }
-    } catch (err) {
-      // Ignore discovery errors
-    }
-  }
-
-  /**
-   * Get current ring members sorted by consistent hash
-   */
-  public getRingMembers(): RingMember[] {
-    if (!this.crdt) return [];
-
-    const state = this.crdt.value() as unknown as RingState;
-    const members = state.members || {};
-
-    return Object.values(members)
-      .filter((m): m is Omit<RingMember, 'hash'> => !!m.alias && m.alias.startsWith('ring-'))
-      .map(m => ({
-        ...m,
-        hash: consistentHash(m.nodeId)
-      }))
-      .sort((a, b) => {
-        // Sort by hash value (ascending)
-        if (a.hash !== b.hash) return a.hash - b.hash;
-        // Tie-break on nodeId for stability
-        return a.nodeId.localeCompare(b.nodeId);
-      });
-  }
-
-  /**
-   * Get successor and predecessor in the ring
-   */
-  public getRingNeighbors(): RingNeighbors {
-    if (!this.node) {
-      return { successor: null, predecessor: null, successorList: [], ring: [] };
-    }
-
-    const members = this.getRingMembers();
-
-    if (members.length < 3) {
-      return { successor: null, predecessor: null, successorList: [], ring: members };
-    }
-
-    const myIndex = members.findIndex(m => m.nodeId === this.node!.getNodeId());
-
-    if (myIndex === -1) {
-      return { successor: null, predecessor: null, successorList: [], ring: members };
-    }
-
-    const successorIndex = (myIndex + 1) % members.length;
-    const predecessorIndex = (myIndex - 1 + members.length) % members.length;
-
-    // Build successor list (R successors for fault tolerance)
-    const successorList: RingMember[] = [];
-    for (let i = 1; i <= this.successorListSize && i < members.length; i++) {
-      const idx = (myIndex + i) % members.length;
-      successorList.push(members[idx]!);
-    }
-
-    return {
-      successor: members[successorIndex],
-      predecessor: members[predecessorIndex],
-      successorList,
-      ring: members
-    };
-  }
-
-  /**
-   * Find the node responsible for a given key
-   */
-  public findResponsibleNode(key: string): RingMember | null {
     const keyHash = consistentHash(key);
-    const members = this.getRingMembers();
 
-    if (members.length === 0) return null;
+    for (const member of sorted) {
+      if (member.token >= keyHash) return member;
+    }
+    // Wrap around
+    return sorted[0];
+  }
 
-    // Find the first node whose hash is >= keyHash
-    // If none found, wrap around to the first node
-    for (const member of members) {
-      if (member.hash >= keyHash) {
-        return member;
+  /**
+   * Route a request to the responsible node for `key`.
+   * Returns the target RingMember.
+   */
+  routeRequest(key: string): RingMember {
+    return this.findSuccessor(key);
+  }
+
+  /** Return the predecessor and successor of the local node on the ring. */
+  getNeighbors(): RingNeighbors {
+    const sorted = this.getSortedMembers();
+    const idx = sorted.findIndex((m) => m.nodeId === this.nodeId);
+    if (idx === -1) return { predecessor: null, successor: null };
+
+    const pred = idx > 0 ? sorted[idx - 1] : sorted[sorted.length - 1];
+    const succ = idx < sorted.length - 1 ? sorted[idx + 1] : sorted[0];
+
+    return {
+      predecessor: pred.nodeId !== this.nodeId ? pred : null,
+      successor: succ.nodeId !== this.nodeId ? succ : null,
+    };
+  }
+
+  // ─── Crash handling (garbage collection of stale nodes) ───────────────
+
+  /**
+   * Remove nodes from the Yjs doc whose awareness has expired.
+   */
+  cleanupOfflineNodes(): string[] {
+    const removed = this.awareness.cleanup();
+
+    if (removed.length > 0) {
+      this.ydoc.transact(() => {
+        for (const id of removed) {
+          this.removeNodeFromRing(id);
+          logger.info('Cleaned up offline node', { nodeId: id });
+          this.emit('member-left', id);
+        }
+      });
+    }
+
+    return removed;
+  }
+
+  // ─── Yjs sync helpers ─────────────────────────────────────────────────
+
+  /** Encode the local state vector (for sending to peers). */
+  encodeStateVector(): Uint8Array {
+    return Y.encodeStateVector(this.ydoc);
+  }
+
+  /** Compute the diff needed to bring a peer up to date. */
+  encodeDiff(remoteStateVector: Uint8Array): Uint8Array {
+    return Y.encodeStateAsUpdate(this.ydoc, remoteStateVector);
+  }
+
+  /** Apply a remote Yjs update to the local document. */
+  applyRemoteUpdate(update: Uint8Array): void {
+    Y.applyUpdate(this.ydoc, update, 'remote');
+  }
+
+  /**
+   * Check whether a remote state vector is already covered by the local
+   * document (i.e. the diff would be empty). Used for quorum convergence.
+   */
+  isConvergedWith(remoteStateVector: Uint8Array): boolean {
+    const diff = Y.encodeStateAsUpdate(this.ydoc, remoteStateVector);
+    // A Yjs update with only the header (length ≤ 2) means "nothing to sync"
+    return diff.length <= 2;
+  }
+
+  // ─── Peer discovery wiring ────────────────────────────────────────────
+
+  /**
+   * Wire PMD peer events into the ring awareness and known-peers cache.
+   */
+  private wirePeerDiscovery(): void {
+    this.on('peer:join', (peer: PeerInfo) => {
+      logger.info('Peer discovered via PMD', { peerId: peer.nodeId });
+      this.knownPeers.set(peer.nodeId, peer);
+
+      // Start a bidirectional sync with the new peer:
+      // Send our state vector (step 1) so they can compute & send
+      // what we are missing, and also push our full state so they
+      // learn about us immediately (even if they haven't joined yet).
+      this.pushFullStateTo(peer);
+      this.sendRingMessageTo(peer, {
+        type: 'ring:sync-step1',
+        sv: encodeUpdate(this.encodeStateVector()),
+      });
+    });
+
+    this.on('peer:leave', (peer: PeerInfo) => {
+      logger.info('Peer left via PMD', { peerId: peer.nodeId });
+      this.knownPeers.delete(peer.nodeId);
+
+      // Mark peer offline in awareness
+      this.awareness.setRemoteState(peer.nodeId, null);
+    });
+  }
+
+  /**
+   * Wire incoming transport messages to the ring protocol handler.
+   */
+  private wireIncomingMessages(): void {
+    this.on('message', (message: any, meta: any) => {
+      if (message && typeof message.type === 'string' && message.type.startsWith('ring:')) {
+        this.handleRingMessage(message as RingMessage, meta);
       }
-    }
-
-    // Wrap around to the first node
-    return members[0] || null;
-  }
-
-  /**
-   * Store a key-value pair in the DHT
-   */
-  public async put(key: string, value: any): Promise<void> {
-    const responsible = this.findResponsibleNode(key);
-
-    if (!responsible || !this.node) {
-      throw new Error('Ring not ready or no responsible node found');
-    }
-
-    // If we're responsible, store locally
-    if (responsible.nodeId === this.node.getNodeId()) {
-      this.storage.set(key, value);
-      logger.debug('Stored key locally', {
-        alias: this.alias,
-        key,
-        valueType: typeof value
-      });
-      return;
-    }
-
-    // Otherwise, forward to responsible node
-    try {
-      await this.node.send(responsible.alias, {
-        type: 'DHT_PUT',
-        key,
-        value,
-        from: this.alias
-      });
-
-      logger.debug('Forwarded PUT to responsible node', {
-        alias: this.alias,
-        key,
-        responsibleNode: responsible.alias
-      });
-    } catch (err) {
-      logger.error('Failed to forward PUT', {
-        alias: this.alias,
-        key,
-        error: err instanceof Error ? err.message : String(err)
-      });
-      throw err;
-    }
-  }
-
-  /**
-   * Retrieve a value from the DHT
-   */
-  public async get(key: string): Promise<any> {
-    const responsible = this.findResponsibleNode(key);
-
-    if (!responsible || !this.node) {
-      throw new Error('Ring not ready or no responsible node found');
-    }
-
-    // If we're responsible, return local value
-    if (responsible.nodeId === this.node.getNodeId()) {
-      const value = this.storage.get(key);
-      logger.debug('Retrieved key locally', {
-        alias: this.alias,
-        key,
-        found: value !== undefined
-      });
-      return value;
-    }
-
-    // Otherwise, ask responsible node (async request/response pattern)
-    return new Promise((resolve, reject) => {
-      const requestId = this.generateRequestId();
-
-      // Set up timeout
-      const timeout = setTimeout(() => {
-        this.pendingRequests.delete(requestId);
-        reject(new Error(`DHT GET timeout for key ${key}`));
-      }, 5000);
-
-      // Store pending request
-      this.pendingRequests.set(requestId, { resolve, reject, timeout });
-
-      // Send request (fire and forget)
-      this.node!.send(responsible.alias, {
-        type: 'DHT_GET',
-        key,
-        requestId,
-        from: this.alias
-      }).catch((err) => {
-        this.pendingRequests.delete(requestId);
-        clearTimeout(timeout);
-        reject(err);
-      });
-
-      logger.debug('Sent DHT GET request', {
-        alias: this.alias,
-        key,
-        requestId,
-        responsibleNode: responsible.alias
-      });
     });
   }
 
+  // ─── Ring protocol ────────────────────────────────────────────────────
+
   /**
-   * Verify and correct successor pointers (Chord stabilization)
+   * Handle an incoming ring protocol message.
    */
-  protected async stabilize(): Promise<void> {
-    if (!this.node) return;
+  private handleRingMessage(msg: RingMessage, meta: any): void {
+    switch (msg.type) {
+      case 'ring:update': {
+        const update = decodeUpdate(msg.update);
+        this.applyRemoteUpdate(update);
+        break;
+      }
 
-    const { successor } = this.getRingNeighbors();
+      case 'ring:awareness': {
+        this.awareness.setRemoteState(msg.nodeId, msg.entry);
+        break;
+      }
 
-    if (!successor) {
-      logger.debug('No successor to stabilize', { alias: this.alias });
-      return;
-    }
-
-    // Create promise for stabilization response
-    const requestId = this.generateRequestId();
-
-    const stabilizePromise = new Promise<any>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pendingRequests.delete(requestId);
-        reject(new Error('Stabilization request timeout'));
-      }, 5000);
-
-      this.pendingRequests.set(requestId, { resolve, reject, timeout });
-
-      // Send stabilization request (fire and forget)
-      this.node!.send(successor.alias, {
-        type: 'STABILIZE_REQUEST',
-        requestId,
-        from: this.alias,
-        nodeId: this.node!.getNodeId()
-      }).catch((err) => {
-        this.pendingRequests.delete(requestId);
-        clearTimeout(timeout);
-        reject(err);
-      });
-    });
-
-    try {
-      const response = await stabilizePromise;
-
-      // If successor has a predecessor between us and it, that should be our successor
-      if (response?.predecessor) {
-        const pred = response.predecessor as RingMember;
-        const myHash = consistentHash(this.node.getNodeId());
-        const succHash = successor.hash;
-        const predHash = pred.hash;
-
-        // Check if pred is between us and successor in the ring
-        const isBetween = (myHash < succHash && predHash > myHash && predHash < succHash) ||
-          (myHash > succHash && (predHash > myHash || predHash < succHash));
-
-        if (isBetween) {
-          logger.debug('Found better successor during stabilization', {
-            alias: this.alias,
-            oldSuccessor: successor.alias,
-            newSuccessor: pred.alias
+      case 'ring:sync-step1': {
+        // Peer sent us its state vector → reply with what it's missing
+        // (our diff) AND our own state vector so it can reply with
+        // what we're missing (true 2-way Yjs sync).
+        const remoteSV = decodeUpdate(msg.sv);
+        const diff = this.encodeDiff(remoteSV);
+        const fromId = meta?.from as string | undefined;
+        const peer = fromId ? this.knownPeers.get(fromId) : undefined;
+        if (peer) {
+          this.sendRingMessageTo(peer, {
+            type: 'ring:sync-step2',
+            sv: encodeUpdate(this.encodeStateVector()),
+            update: encodeUpdate(diff),
           });
         }
+        break;
       }
 
-      // Notify successor that we think we are its predecessor
-      await this.notify(successor);
-
-    } catch (err) {
-      logger.warn('Stabilization failed', {
-        alias: this.alias,
-        successor: successor.alias,
-        error: err instanceof Error ? err.message : String(err)
-      });
+      case 'ring:sync-step2': {
+        // Peer replied with its diff + its own state vector.
+        // Apply the diff, then send back anything it still needs.
+        const update = decodeUpdate(msg.update);
+        if (update.length > 2) {
+          this.applyRemoteUpdate(update);
+        }
+        const remoteSV = decodeUpdate(msg.sv);
+        const ourDiff = this.encodeDiff(remoteSV);
+        if (ourDiff.length > 2) {
+          const fromId = meta?.from as string | undefined;
+          const peer = fromId ? this.knownPeers.get(fromId) : undefined;
+          if (peer) {
+            this.sendRingMessageTo(peer, {
+              type: 'ring:update',
+              update: encodeUpdate(ourDiff),
+            });
+          }
+        }
+        break;
+      }
     }
   }
 
   /**
-   * Notify a node that we think we are its predecessor
+   * Broadcast a ring message to all known peers via the transport layer.
    */
-  protected async notify(node: RingMember): Promise<void> {
-    if (!this.node) return;
-
-    try {
-      await this.node.send(node.alias, {
-        type: 'NOTIFY',
-        from: this.alias,
-        nodeId: this.node.getNodeId(),
-        hash: consistentHash(this.node.getNodeId())
-      });
-
-      logger.debug('Sent notify to node', {
-        alias: this.alias,
-        target: node.alias
-      });
-    } catch (err) {
-      // Ignore notify errors - not critical
-    }
-  }
-
-  /**
-   * Handle incoming messages
-   */
-  protected handleMessage(message: any, meta: MessageMetadata): void {
-    switch (message.type) {
-      case 'CRDT_SYNC_REQUEST':
-        this.handleCrdtSyncRequest(message, meta);
-        break;
-
-      case 'CRDT_SYNC_RESPONSE':
-        this.handleCrdtSyncResponse(message, meta);
-        break;
-
-      case 'CRDT_OP':
-        this.handleCrdtOp(message, meta);
-        break;
-
-      case 'TOKEN':
-        this.handleToken(message, meta);
-        break;
-
-      case 'DHT_PUT':
-        this.handleDhtPut(message, meta);
-        break;
-
-      case 'DHT_GET':
-        this.handleDhtGet(message, meta);
-        break;
-
-      case 'STABILIZE_REQUEST':
-        this.handleStabilizeRequest(message, meta);
-        break;
-
-      case 'NOTIFY':
-        this.handleNotify(message, meta);
-        break;
-
-      case 'DHT_GET_RESPONSE':
-        this.handleDhtGetResponse(message, meta);
-        break;
-
-      case 'STABILIZE_RESPONSE':
-        this.handleStabilizeResponse(message, meta);
-        break;
-
-      case 'PING':
-        logger.debug('PING received', { alias: this.alias, from: meta.from });
-        this.node?.send(meta.from, { type: 'PONG', original: message }).catch(() => { });
-        break;
-
-      default:
-        logger.debug('Message received', { alias: this.alias, from: meta.from, type: message.type });
-    }
-  }
-
-  /**
-   * Handle CRDT sync request
-   */
-  protected handleCrdtSyncRequest(message: any, meta: MessageMetadata): void {
-    if (!this.node || !this.crdt) return;
-
-    const remoteClock = message.clock;
-    const myOps = this.crdt.diffSince(remoteClock);
-
-    // Send back our ops that are newer
-    this.node.send(meta.from, {
-      type: 'CRDT_SYNC_RESPONSE',
-      ops: myOps.map((op: any) => JSONCrdt.encodeOp(op)),
-      clock: this.crdt.clock()
-    }).catch(() => { });
-
-    // Also ensure the remote node is in our members if they're a ring node
-    if (message.nodeId && message.from && message.from.startsWith('ring-')) {
-      const state = this.crdt.value() as unknown as RingState;
-      const members = state.members || {};
-
-      if (!members[message.nodeId]) {
-        this.crdt.set(['members', message.nodeId], {
-          alias: message.from,
-          nodeId: message.nodeId,
-          joinedAt: Date.now()
+  private broadcastRingMessage(msg: RingMessage): void {
+    for (const [, peer] of this.knownPeers) {
+      this.sendRingMessageTo(peer, msg).catch((err) => {
+        logger.warn('Broadcast to peer failed', {
+          peerId: peer.nodeId,
+          error: (err as Error).message,
         });
-        this.onTopologyChange();
+      });
+    }
+  }
+
+  /**
+   * Send a ring message to a specific peer via the transport layer.
+   */
+  private async sendRingMessageTo(
+    peer: PeerInfo,
+    msg: RingMessage,
+  ): Promise<void> {
+    await this.transport.send(
+      peer.host,
+      peer.port,
+      this.nodeId,
+      peer.nodeId,
+      msg,
+    );
+  }
+
+  /**
+   * Discover existing peers from PMD and populate knownPeers.
+   * Called BEFORE joinRing so that the Yjs update broadcast reaches them.
+   */
+  private async discoverExistingPeers(): Promise<void> {
+    try {
+      const peers = await this.discover();
+      for (const peer of peers) {
+        this.knownPeers.set(peer.nodeId, peer);
+        logger.info('Pre-discovered peer', { peerId: peer.nodeId });
+      }
+    } catch (err) {
+      logger.warn('Failed to discover existing peers', {
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  /**
+   * Full bidirectional sync with every known peer:
+   * 1. Push our full Yjs state (so they learn about us immediately)
+   * 2. Send sync-step1 (our SV) so they reply with what we're missing
+   */
+  private async syncWithExistingPeers(): Promise<void> {
+    for (const [, peer] of this.knownPeers) {
+      try {
+        // Push our full state
+        await this.pushFullStateTo(peer);
+
+        // Pull: send our state vector → peer replies with its diff
+        await this.sendRingMessageTo(peer, {
+          type: 'ring:sync-step1',
+          sv: encodeUpdate(this.encodeStateVector()),
+        });
+      } catch (err) {
+        logger.warn('Initial sync with peer failed', {
+          peerId: peer.nodeId,
+          error: (err as Error).message,
+        });
       }
     }
   }
 
   /**
-   * Handle CRDT sync response
+   * Push our full Yjs document state to a single peer as a ring:update.
    */
-  protected handleCrdtSyncResponse(message: any, meta: MessageMetadata): void {
-    if (!this.crdt) return;
+  private async pushFullStateTo(peer: PeerInfo): Promise<void> {
+    const fullState = Y.encodeStateAsUpdate(this.ydoc);
+    if (fullState.length > 2) {
+      await this.sendRingMessageTo(peer, {
+        type: 'ring:update',
+        update: encodeUpdate(fullState),
+      });
+    }
+  }
 
-    // Apply received ops to our CRDT
-    const ops = message.ops.map((opStr: string) => JSONCrdt.decodeOp(opStr));
+  // ─── State machine internals ──────────────────────────────────────────
 
-    let applied = 0;
-    for (const op of ops) {
-      if (this.crdt.receive(op)) {
-        applied++;
+  /** Handler for Yjs document updates → mark topology change + broadcast */
+  private onDocUpdate = (update: Uint8Array, origin: any): void => {
+    this.lastTopologyChangeTs = Date.now();
+
+    if (this._ringState === RingState.STABLE) {
+      this.setRingState(RingState.UNSTABLE);
+    }
+
+    // Broadcast to peers (but NOT if this update came from the network)
+    if (origin !== 'remote') {
+      this.broadcastRingMessage({
+        type: 'ring:update',
+        update: encodeUpdate(update),
+      });
+    }
+
+    logger.debug('Doc updated', { origin, members: this.ringArray.length });
+  };
+
+  /**
+   * Handler for awareness changes → mark awareness change.
+   *
+   * Only `added` or `removed` entries represent real topology changes
+   * (a new peer appearing or an existing peer going offline).  Plain
+   * `updated` entries are heartbeat refreshes (local *or* remote) and
+   * must NOT reset the stability timer – otherwise the 15 s quiescence
+   * window can never be reached because every node broadcasts a
+   * heartbeat every 5 s.
+   */
+  private onAwarenessChange = (change: {
+    added: string[];
+    updated: string[];
+    removed: string[];
+  }): void => {
+    const isTopologyChange =
+      change.added.length > 0 || change.removed.length > 0;
+
+    if (isTopologyChange) {
+      this.lastAwarenessChangeTs = Date.now();
+
+      if (this._ringState === RingState.STABLE) {
+        this.setRingState(RingState.UNSTABLE);
       }
     }
 
-    if (applied > 0) {
-      logger.debug('Applied CRDT ops', { alias: this.alias, from: meta.from, count: applied });
-      this.onTopologyChange();
-    }
+    this.emit('awareness-change', change);
+
+    logger.debug('Awareness changed', { ...change, isTopologyChange });
+  };
+
+  /**
+   * Stability-detection tick.
+   * Transitions UNSTABLE → STABLE when:
+   *  1. No awareness change for `stabilityWindow` ms
+   *  2. No doc update for `stabilityWindow` ms
+   *  3. Quorum of online peers have converged (CRDT-safe)
+   */
+  private stabilityCheck(): void {
+    if (this._ringState === RingState.STABLE) return;
+
+    const now = Date.now();
+
+    const awarenessQuiet =
+      now - this.lastAwarenessChangeTs > this.stabilityWindow;
+    const topologyQuiet =
+      now - this.lastTopologyChangeTs > this.stabilityWindow;
+
+    if (!awarenessQuiet || !topologyQuiet) return;
+
+    if (!this.hasQuorumConverged()) return;
+
+    this.setRingState(RingState.STABLE);
+    this.onRingStable();
   }
 
   /**
-   * Handle individual CRDT op
+   * Check whether a quorum of online peers share the same Yjs state.
+   *
+   * Default implementation: we consider quorum reached when at least
+   * `quorumRatio` of ring members are visible in awareness.  In a
+   * multi-process deployment this can be overridden to perform actual
+   * state-vector diffing over the network.
    */
-  protected handleCrdtOp(message: any, meta: MessageMetadata): void {
-    if (!this.crdt) return;
+  hasQuorumConverged(): boolean {
+    const members = this.getSortedMembers();
+    if (members.length === 0) return false;
 
-    const op = JSONCrdt.decodeOp(message.op);
-    const applied = this.crdt.receive(op);
+    const onlinePeers = this.awareness.getOnlinePeers();
+    const quorumSize = Math.ceil(members.length * this.quorumRatio);
 
-    if (applied) {
-      this.onTopologyChange();
-      logger.debug('Applied single CRDT op', { alias: this.alias, from: meta.from });
-    }
+    return onlinePeers.length >= quorumSize;
   }
 
-  /**
-   * Handle token passing in the ring
-   */
-  protected handleToken(message: any, meta: MessageMetadata): void {
-    if (!this.node || !this.crdt) return;
-
-    logger.info('Token received', {
-      alias: this.alias,
-      from: meta.from,
-      round: message.round,
-      hop: message.hop
+  /** Called once when the ring transitions to STABLE */
+  private onRingStable(): void {
+    const sorted = this.getSortedMembers();
+    logger.info('Ring is stable', {
+      members: sorted.length,
+      nodes: sorted.map((m) => m.nodeId),
     });
+    this.emit('ring-stable', sorted);
+  }
 
-    const { ring } = this.getRingNeighbors();
+  // ─── Helpers ──────────────────────────────────────────────────────────
 
-    if (message.hop >= ring.length) {
-      logger.info('Token completed round', { alias: this.alias, round: message.round });
+  private setRingState(next: RingState): void {
+    const prev = this._ringState;
+    if (prev === next) return;
 
-      // Update token state in CRDT
-      this.crdt.set(['token'], {
-        round: message.round,
-        completedAt: Date.now(),
-        completedBy: this.alias
-      });
+    this._ringState = next;
+    logger.info(`State: ${prev} → ${next}`, { nodeId: this.nodeId });
+    this.emit('state-change', next, prev);
 
-      // Start new round
-      setTimeout(() => {
-        const { successor } = this.getRingNeighbors();
-        if (successor && this.node) {
-          logger.info('Starting new token round', { alias: this.alias, round: message.round + 1 });
-          this.node.send(successor.alias, {
-            type: 'TOKEN',
-            round: message.round + 1,
-            hop: 1,
-            initiator: this.alias
-          }).catch(() => { });
-        }
-      }, 2000);
-    } else {
-      // Pass token to successor
-      setTimeout(() => {
-        const { successor } = this.getRingNeighbors();
-        if (successor && this.node) {
-          logger.debug('Passing token', { alias: this.alias, to: successor.alias });
-          this.node.send(successor.alias, {
-            type: 'TOKEN',
-            round: message.round,
-            hop: message.hop + 1,
-            initiator: message.initiator
-          }).catch(() => { });
-        }
-      }, 1000);
+    if (next === RingState.UNSTABLE) {
+      this.emit('ring-unstable');
     }
   }
 
-  /**
-   * Handle DHT PUT request
-   */
-  protected handleDhtPut(message: any, meta: MessageMetadata): void {
-    const { key, value } = message;
-
-    this.storage.set(key, value);
-
-    logger.debug('Stored key from remote node', {
-      alias: this.alias,
-      key,
-      from: meta.from
-    });
-
-    // Send acknowledgment
-    if (this.node) {
-      this.node.send(meta.from, {
-        type: 'DHT_PUT_ACK',
-        key,
-        success: true
-      }).catch(() => { });
+  private stopRingTimers(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
     }
-  }
-
-  /**
-   * Handle DHT GET request
-   */
-  protected handleDhtGet(message: any, meta: MessageMetadata): void {
-    const { key, requestId } = message;
-    const value = this.storage.get(key);
-
-    logger.debug('Retrieved key for remote node', {
-      alias: this.alias,
-      key,
-      requestId,
-      from: meta.from,
-      found: value !== undefined
-    });
-
-    // Send response with requestId
-    if (this.node) {
-      this.node.send(meta.from, {
-        type: 'DHT_GET_RESPONSE',
-        requestId,
-        key,
-        value,
-        found: value !== undefined
-      }).catch(() => { });
+    if (this.stabilityTimer) {
+      clearInterval(this.stabilityTimer);
+      this.stabilityTimer = undefined;
     }
-  }
-
-  /**
-   * Handle DHT GET response
-   */
-  protected handleDhtGetResponse(message: any, _meta: MessageMetadata): void {
-    const { requestId, value } = message;
-
-    const pending = this.pendingRequests.get(requestId);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      this.pendingRequests.delete(requestId);
-      pending.resolve(value);
-
-      logger.debug('DHT GET response received', {
-        alias: this.alias,
-        requestId,
-        found: value !== undefined
-      });
-    }
-  }
-
-  /**
-   * Handle stabilization request
-   */
-  protected handleStabilizeRequest(message: any, meta: MessageMetadata): void {
-    const { requestId } = message;
-    const { predecessor } = this.getRingNeighbors();
-
-    if (this.node) {
-      this.node.send(meta.from, {
-        type: 'STABILIZE_RESPONSE',
-        requestId,
-        predecessor: predecessor || null
-      }).catch(() => { });
-    }
-  }
-
-  /**
-   * Handle stabilization response
-   */
-  protected handleStabilizeResponse(message: any, _meta: MessageMetadata): void {
-    const { requestId, predecessor } = message;
-
-    const pending = this.pendingRequests.get(requestId);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      this.pendingRequests.delete(requestId);
-      pending.resolve({ predecessor });
-
-      logger.debug('Stabilization response received', {
-        alias: this.alias,
-        requestId,
-        hasPredecessor: predecessor !== null
-      });
-    }
-  }
-
-  /**
-   * Handle notify from potential predecessor
-   */
-  protected handleNotify(message: any, meta: MessageMetadata): void {
-    if (!this.node) return;
-
-    const { hash } = message;
-    const { predecessor } = this.getRingNeighbors();
-
-    // If we don't have a predecessor, or the notifying node is between
-    // our current predecessor and us, update our predecessor
-    if (!predecessor) {
-      logger.debug('Accepted new predecessor (no previous)', {
-        alias: this.alias,
-        newPredecessor: meta.from
-      });
-      return;
-    }
-
-    const myHash = consistentHash(this.node.getNodeId());
-    const predHash = predecessor.hash;
-
-    // Check if notifying node is between predecessor and us
-    const isBetween = (predHash < myHash && hash > predHash && hash < myHash) ||
-      (predHash > myHash && (hash > predHash || hash < myHash));
-
-    if (isBetween) {
-      logger.debug('Updated predecessor via notify', {
-        alias: this.alias,
-        oldPredecessor: predecessor.alias,
-        newPredecessor: meta.from
-      });
-    }
-  }
-
-  /**
-   * Display current ring status
-   */
-  public displayRingStatus(): void {
-    if (!this.node || !this.crdt) return;
-
-    const { ring } = this.getRingNeighbors();
-
-    if (ring.length < this.replicationFactor) {
-      logger.info('Ring status: waiting for minimum nodes', {
-        alias: this.alias,
-        current: ring.length,
-        minimum: this.replicationFactor
-      });
-      return;
-    }
-
-    const ringOrder = ring.map((n) => {
-      const hashStr = n.hash.toString(16).substring(0, 8);
-      if (n.nodeId === this.node!.getNodeId()) {
-        return `[${n.alias}@${hashStr}]`; // Mark self with brackets
-      }
-      return `${n.alias}@${hashStr}`;
-    }).join(' → ');
-
-    logger.info('Ring topology', {
-      alias: this.alias,
-      ring: ringOrder + ' → (cycle)'
-    });
-
-    // Display CRDT info
-    const state = this.crdt.value() as unknown as RingState;
-    const clock = this.crdt.clock();
-    const clockStr = Object.entries(clock)
-      .map(([id, v]) => `${id.slice(0, 8)}:${v}`)
-      .join(', ');
-
-    if (clockStr) {
-      logger.info('Vector clock', {
-        alias: this.alias,
-        clock: clockStr
-      });
-    }
-
-    if (state.token) {
-      logger.info('Token state', {
-        alias: this.alias,
-        round: state.token.round,
-        completedBy: state.token.completedBy
-      });
-    }
-  }
-
-  /**
-   * Display CRDT metrics for observability
-   */
-  protected displayCrdtMetrics(): void {
-    if (!this.crdt) return;
-
-    const metrics = this.crdt.getMetrics();
-
-    logger.info('CRDT metrics', {
-      alias: this.alias,
-      totalOps: metrics.totalOps,
-      localOps: metrics.localOps,
-      remoteOps: metrics.remoteOps,
-      opsPerSec: metrics.opsPerSecond.toFixed(2),
-      avgLatency: metrics.avgLatencyMs.toFixed(2) + 'ms',
-      conflicts: metrics.totalConflicts,
-      logSize: metrics.logSize,
-      pendingSize: metrics.pendingSize,
-      gcRuns: metrics.gcRuns
-    });
-  }
-
-  /**
-   * Get CRDT inspection data for debugging
-   */
-  public inspectCrdt(): any {
-    if (!this.crdt) return null;
-
-    return this.crdt.inspect({
-      logSampleSize: 10,
-      pendingSampleSize: 5,
-      includeCausalGraph: true
-    });
-  }
-
-  /**
-   * Manually trigger CRDT garbage collection
-   */
-  public gcCrdt(): void {
-    if (!this.crdt) return;
-
-    logger.info('Manual CRDT GC triggered', { alias: this.alias });
-    this.crdt.gcLog();
-    this.crdt.gcTombstones();
-    this.crdt.cleanPendingBuffer();
-  }
-
-  /**
-   * Initiate a token in the ring (only if we're the first node)
-   */
-  public async initiateToken(): Promise<void> {
-    if (!this.node) return;
-
-    const { ring, successor } = this.getRingNeighbors();
-
-    if (ring.length >= 3 && successor) {
-      logger.info('Initiating token in ring', { alias: this.alias, ringSize: ring.length });
-      await this.node.send(successor.alias, {
-        type: 'TOKEN',
-        round: 1,
-        hop: 1,
-        initiator: this.alias
-      });
-    }
-  }
-
-  /**
-   * Get the underlying NodeRuntime instance
-   */
-  public getNode(): NodeRuntime | null {
-    return this.node;
-  }
-
-  /**
-   * Get the CRDT instance
-   */
-  public getCrdt(): JSONCrdt | null {
-    return this.crdt;
-  }
-
-  /**
-   * Get the alias of this node
-   */
-  public getAlias(): string {
-    return this.alias;
-  }
-
-  /**
-   * Stop the ring node
-   */
-  async stop(): Promise<void> {
-    logger.info('Stopping ring node', { alias: this.alias });
-
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-      this.syncInterval = null;
-    }
-    if (this.displayInterval) {
-      clearInterval(this.displayInterval);
-      this.displayInterval = null;
-    }
-    if (this.metricsInterval) {
-      clearInterval(this.metricsInterval);
-      this.metricsInterval = null;
-    }
-    if (this.stabilizeInterval) {
-      clearInterval(this.stabilizeInterval);
-      this.stabilizeInterval = null;
-    }
-    if (this.stabilityCheckInterval) {
-      clearInterval(this.stabilityCheckInterval);
-      this.stabilityCheckInterval = null;
-    }
-
-    // Clean up pending requests
-    for (const pending of this.pendingRequests.values()) {
-      clearTimeout(pending.timeout);
-      pending.reject(new Error('Node stopped'));
-    }
-    this.pendingRequests.clear();
-
-    if (this.node) {
-      await this.node.shutdown();
-      this.node = null;
-    }
-
-    logger.info('Ring node stopped', { alias: this.alias });
-  }
-
-  /**
-   * Generate a unique request ID
-   */
-  protected generateRequestId(): string {
-    return `${this.alias}-${this.requestIdCounter++}-${Date.now()}`;
   }
 }

@@ -17,7 +17,8 @@
   "author": "pierreg256",
   "license": "MIT",
   "dependencies": {
-    "@distflow/pmd": "^0.1.0"
+    "@distflow/pmd": "^0.1.0",
+    "yjs": "^13.6.29"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

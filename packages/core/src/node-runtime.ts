@@ -16,6 +16,8 @@ const logger = configureLogger({ name: 'node-runtime', level: LogLevel.INFO });
  * Node runtime configuration
  */
 export interface NodeRuntimeOptions {
+  /** Optional fixed node identifier (auto-generated if omitted) */
+  nodeId?: string;
   alias?: string;
   pmdPort?: number;
   pmdHost?: string;
@@ -37,23 +39,23 @@ export interface PeerInfo {
  * Singleton pattern - one node per process
  */
 export class NodeRuntime extends EventEmitter {
-  private static instance?: NodeRuntime;
-  private static lockFile?: string;
+  protected static instance?: NodeRuntime;
+  protected static lockFile?: string;
 
-  private nodeId: string;
-  private alias?: string;
-  private mailbox: Mailbox;
-  private pmdClient: PMDClient;
-  private transport: Transport;
-  private heartbeatTimer?: NodeJS.Timeout;
+  protected nodeId: string;
+  protected alias?: string;
+  protected mailbox: Mailbox;
+  protected pmdClient: PMDClient;
+  protected transport: Transport;
   private pmdProcess?: child_process.ChildProcess;
-  private isStarted = false;
+  protected isStarted = false;
+  protected shouldMaintainPMDConnection = true;
 
-  private constructor(options: NodeRuntimeOptions = {}) {
+  protected constructor(options: NodeRuntimeOptions = {}) {
     super();
 
-    // Generate unique node ID
-    this.nodeId = this.generateNodeId();
+    // Generate unique node ID (or use the one provided)
+    this.nodeId = options.nodeId ?? this.generateNodeId();
     this.alias = options.alias;
 
     // Initialize components
@@ -102,7 +104,7 @@ export class NodeRuntime extends EventEmitter {
   /**
    * Initialize the node runtime
    */
-  private async initialize(pmdPort: number): Promise<void> {
+  protected async initialize(pmdPort: number): Promise<void> {
     // Try to start PMD if not running
     await this.ensurePMDRunning(pmdPort);
 
@@ -123,22 +125,22 @@ export class NodeRuntime extends EventEmitter {
     // Connect to PMD
     await this.connectToPMD();
 
+    // Setup automatic reconnection
+    this.setupPMDReconnection();
+
     // Register with PMD
     await this.pmdClient.register(this.nodeId, this.alias, 'localhost', port);
 
     // Watch for peer events
     await this.pmdClient.watch();
 
-    this.pmdClient.on('peer:join', (peer) => {
+    this.pmdClient.onPeerEvent('peer:join', (peer) => {
       this.emit('peer:join', peer);
     });
 
-    this.pmdClient.on('peer:leave', (peer) => {
+    this.pmdClient.onPeerEvent('peer:leave', (peer) => {
       this.emit('peer:leave', peer);
     });
-
-    // Start heartbeat
-    this.startHeartbeat();
 
     this.isStarted = true;
   }
@@ -222,22 +224,52 @@ export class NodeRuntime extends EventEmitter {
   }
 
   /**
-   * Start heartbeat timer
+   * Setup automatic PMD reconnection
    */
-  private startHeartbeat(): void {
-    this.heartbeatTimer = setInterval(async () => {
-      try {
-        await this.pmdClient.heartbeat(this.nodeId);
-      } catch (err) {
-        logger.error('Heartbeat failed:', new Error(JSON.stringify(err)));
+  private setupPMDReconnection(): void {
+    this.pmdClient.on('disconnect', async () => {
+      if (!this.shouldMaintainPMDConnection) {
+        return; // Intentional shutdown
       }
-    }, 1000); // Every 1 second (1/3 of PMD TTL for safety margin)
+
+      logger.warn('PMD connection lost, attempting reconnect...');
+
+      // Wait before reconnecting
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      try {
+        await this.connectToPMD(10); // More retries
+
+        // Re-register after reconnection
+        const port = this.transport.getPort();
+        if (port === undefined) {
+          throw new Error('Transport port not available');
+        }
+
+        await this.pmdClient.register(
+          this.nodeId,
+          this.alias,
+          'localhost',
+          port
+        );
+
+        await this.pmdClient.watch();
+
+        logger.info('Reconnected to PMD');
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        logger.error('Failed to reconnect to PMD', error);
+
+        // Retry after longer delay
+        setTimeout(() => this.setupPMDReconnection(), 5000);
+      }
+    });
   }
 
   /**
    * Generate unique node ID
    */
-  private generateNodeId(): string {
+  protected generateNodeId(): string {
     const machineId = os.hostname();
     const pid = process.pid;
     const random = crypto.randomBytes(8).toString('hex');
@@ -321,28 +353,24 @@ export class NodeRuntime extends EventEmitter {
       return;
     }
 
-    // Unregister from PMD BEFORE stopping heartbeat
-    // This ensures the node is still considered "alive" when we unregister
+    // Indicate we no longer want to reconnect
+    this.shouldMaintainPMDConnection = false;
+
+    // Unregister from PMD
     try {
       await this.pmdClient.unregister(this.nodeId);
     } catch (err: any) {
-      // If the node was already removed by PMD cleanup (e.g., due to missed heartbeats),
-      // or if the PMD connection is already closed, this is not a critical error
+      // Graceful handling of common shutdown scenarios
       if (err.message === 'Node not found') {
-        logger.warn('Node was already removed from PMD registry (likely due to cleanup)');
+        logger.warn('Node was already removed from PMD registry');
       } else if (err.message === 'Not connected to PMD') {
-        logger.warn('PMD connection already closed (PMD may have shut down)');
+        logger.warn('PMD connection already closed');
       } else {
         logger.error('Failed to unregister:', err);
       }
     }
 
-    // Stop heartbeat after unregistering
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-    }
-
-    // Disconnect from PMD
+    // Disconnect from PMD (triggers socket close, which removes node from registry)
     this.pmdClient.disconnect();
 
     // Stop transport

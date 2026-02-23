@@ -20,8 +20,8 @@ export class PMD extends EventEmitter {
   private registry: Map<string, NodeInfo> = new Map();
   private aliasMap: Map<string, string> = new Map(); // alias -> nodeId
   private watchers: Set<net.Socket> = new Set();
+  private nodeSockets: Map<string, net.Socket> = new Map(); // nodeId -> socket (persistent connection)
   private options: Required<PMDOptions>;
-  private cleanupTimer?: NodeJS.Timeout;
   private autoShutdownTimer?: NodeJS.Timeout;
 
   constructor(options: PMDOptions) {
@@ -43,7 +43,6 @@ export class PMD extends EventEmitter {
     return new Promise((resolve, reject) => {
       this.server.listen(this.options.port, () => {
         console.log(`PMD listening on port ${this.options.port}`);
-        this.startCleanupTimer();
         resolve();
       });
 
@@ -57,10 +56,6 @@ export class PMD extends EventEmitter {
    * Stop the PMD server
    */
   async stop(): Promise<void> {
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-    }
-
     if (this.autoShutdownTimer) {
       clearTimeout(this.autoShutdownTimer);
     }
@@ -78,6 +73,7 @@ export class PMD extends EventEmitter {
    */
   private handleConnection(socket: net.Socket): void {
     let buffer = Buffer.alloc(0);
+    let associatedNodeId: string | undefined;
 
     socket.on('data', (data) => {
       buffer = Buffer.concat([buffer, data]);
@@ -85,14 +81,17 @@ export class PMD extends EventEmitter {
       // Process complete messages (4 bytes length + JSON payload)
       while (buffer.length >= 4) {
         const length = buffer.readUInt32BE(0);
-        
+
         if (buffer.length >= 4 + length) {
           const messageData = buffer.slice(4, 4 + length);
           buffer = buffer.slice(4 + length);
 
           try {
             const message: Message = JSON.parse(messageData.toString('utf-8'));
-            this.handleMessage(socket, message);
+            this.handleMessage(socket, message, (nodeId) => {
+              // Callback to associate socket with nodeId on REGISTER
+              associatedNodeId = nodeId;
+            });
           } catch (err) {
             console.error('Failed to parse message:', err);
           }
@@ -108,16 +107,26 @@ export class PMD extends EventEmitter {
 
     socket.on('close', () => {
       this.watchers.delete(socket);
+
+      // If this socket was associated with a node, remove it immediately
+      if (associatedNodeId) {
+        console.log(`Node ${associatedNodeId} disconnected (socket closed)`);
+        this.removeNode(associatedNodeId, 'socket_closed');
+      }
     });
   }
 
   /**
    * Handle incoming message
    */
-  private handleMessage(socket: net.Socket, message: Message): void {
+  private handleMessage(
+    socket: net.Socket,
+    message: Message,
+    onAssociate?: (nodeId: string) => void
+  ): void {
     switch (message.type) {
       case MessageType.REGISTER:
-        this.handleRegister(socket, message);
+        this.handleRegister(socket, message, onAssociate);
         break;
       case MessageType.UNREGISTER:
         this.handleUnregister(socket, message);
@@ -145,9 +154,13 @@ export class PMD extends EventEmitter {
   /**
    * Register a new node
    */
-  private handleRegister(socket: net.Socket, message: Message): void {
+  private handleRegister(
+    socket: net.Socket,
+    message: Message,
+    onAssociate?: (nodeId: string) => void
+  ): void {
     const payload = message.payload as RegisterPayload;
-    
+
     const nodeInfo: NodeInfo = {
       nodeId: payload.nodeId,
       alias: payload.alias,
@@ -160,8 +173,8 @@ export class PMD extends EventEmitter {
     if (payload.alias && this.aliasMap.has(payload.alias)) {
       const existingNodeId = this.aliasMap.get(payload.alias)!;
       if (existingNodeId !== payload.nodeId) {
-        this.sendResponse(socket, message.requestId, { 
-          error: `Alias '${payload.alias}' already in use` 
+        this.sendResponse(socket, message.requestId, {
+          error: `Alias '${payload.alias}' already in use`
         });
         return;
       }
@@ -169,9 +182,17 @@ export class PMD extends EventEmitter {
 
     const isNew = !this.registry.has(payload.nodeId);
     this.registry.set(payload.nodeId, nodeInfo);
-    
+
+    // Associate socket with nodeId for persistent connection
+    this.nodeSockets.set(payload.nodeId, socket);
+
     if (payload.alias) {
       this.aliasMap.set(payload.alias, payload.nodeId);
+    }
+
+    // Notify connection handler to track this nodeId
+    if (onAssociate) {
+      onAssociate(payload.nodeId);
     }
 
     // Cancel auto-shutdown if a node registers
@@ -193,16 +214,30 @@ export class PMD extends EventEmitter {
    */
   private handleUnregister(socket: net.Socket, message: Message): void {
     const { nodeId } = message.payload;
+
+    if (this.registry.has(nodeId)) {
+      this.removeNode(nodeId, 'unregister');
+      this.sendResponse(socket, message.requestId, { success: true });
+    } else {
+      this.sendResponse(socket, message.requestId, { error: 'Node not found' });
+    }
+  }
+
+  /**
+   * Remove a node from registry (centralized method)
+   */
+  private removeNode(nodeId: string, reason: string): void {
     const nodeInfo = this.registry.get(nodeId);
 
     if (nodeInfo) {
+      console.log(`Removing node ${nodeId} (reason: ${reason})`);
+
       this.registry.delete(nodeId);
-      
+      this.nodeSockets.delete(nodeId);
+
       if (nodeInfo.alias) {
         this.aliasMap.delete(nodeInfo.alias);
       }
-
-      this.sendResponse(socket, message.requestId, { success: true });
 
       // Notify watchers
       this.notifyWatchers({
@@ -210,10 +245,8 @@ export class PMD extends EventEmitter {
         peer: nodeInfo
       });
 
-      // Check if registry is empty and schedule auto-shutdown
+      // Check auto-shutdown
       this.checkAutoShutdown();
-    } else {
-      this.sendResponse(socket, message.requestId, { error: 'Node not found' });
     }
   }
 
@@ -222,10 +255,10 @@ export class PMD extends EventEmitter {
    */
   private handleResolve(socket: net.Socket, message: Message): void {
     const { alias } = message.payload;
-    
+
     // First try to resolve as alias
     let nodeId = this.aliasMap.get(alias);
-    
+
     // If not found, check if it's a nodeId directly
     if (!nodeId && this.registry.has(alias)) {
       nodeId = alias;
@@ -275,7 +308,7 @@ export class PMD extends EventEmitter {
    */
   private handleShutdown(socket: net.Socket, message: Message): void {
     this.sendResponse(socket, message.requestId, { success: true });
-    
+
     // Give time for response to be sent before shutting down
     setTimeout(() => {
       console.log('Shutdown requested, stopping PMD...');
@@ -322,35 +355,6 @@ export class PMD extends EventEmitter {
     this.watchers.forEach((socket) => {
       this.sendMessage(socket, message);
     });
-  }
-
-  /**
-   * Start cleanup timer to remove stale nodes
-   */
-  private startCleanupTimer(): void {
-    this.cleanupTimer = setInterval(() => {
-      const now = Date.now();
-      
-      for (const [nodeId, nodeInfo] of this.registry.entries()) {
-        if (now - nodeInfo.lastHeartbeat > this.options.ttl) {
-          console.log(`Removing stale node: ${nodeId}`);
-          this.registry.delete(nodeId);
-          
-          if (nodeInfo.alias) {
-            this.aliasMap.delete(nodeInfo.alias);
-          }
-
-          // Notify watchers
-          this.notifyWatchers({
-            event: 'peer:leave',
-            peer: nodeInfo
-          });
-        }
-      }
-
-      // Check if registry is empty and schedule auto-shutdown
-      this.checkAutoShutdown();
-    }, this.options.cleanupInterval);
   }
 
   /**

@@ -20,5 +20,8 @@
   "yaml.schemas": {
     "./.schemas/collection.schema.json": "*.collection.yml",
     "./.schemas/tools.schema.json": "website/data/tools.yml",
+  },
+  "chat.tools.terminal.autoApprove": {
+    "npx tsc": true
   }
 }

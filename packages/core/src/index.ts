@@ -17,7 +17,17 @@ export {
   Hlc,
   OpKind
 } from './json-crdt';
-export { RingNode, RingNodeOptions, RingMember, RingState, RingNeighbors, consistentHash } from './ring-node';
+export {
+  RingNode,
+  RingNodeOptions,
+  RingMember,
+  RingMessage,
+  RingState,
+  RingNeighbors,
+  Awareness,
+  AwarenessEntry,
+  consistentHash,
+} from './ring-node';
 export {
   Logger,
   LogLevel,

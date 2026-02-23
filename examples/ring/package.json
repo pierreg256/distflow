@@ -4,7 +4,8 @@
   "description": "Ring topology example with dynamic node management",
   "scripts": {
     "build": "echo \"No build needed for JS example\"",
-    "start": "node node.js"
+    "start": "node node.js",
+    "front": "node front.js"
   },
   "keywords": [
     "distflow",

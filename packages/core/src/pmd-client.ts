@@ -1,4 +1,5 @@
 import * as net from 'net';
+import { EventEmitter } from 'events';
 
 /**
  * Node registration entry in the PMD registry
@@ -37,7 +38,7 @@ export interface Message {
 /**
  * PMD Client - communicates with the PMD daemon
  */
-export class PMDClient {
+export class PMDClient extends EventEmitter {
   private socket?: net.Socket;
   private buffer: Buffer = Buffer.alloc(0);
   private pendingRequests: Map<string, (response: any) => void> = new Map();
@@ -47,6 +48,7 @@ export class PMDClient {
   private readonly port: number;
 
   constructor(host: string = 'localhost', port: number = 4369) {
+    super();
     this.host = host;
     this.port = port;
   }
@@ -80,10 +82,13 @@ export class PMDClient {
 
     this.socket.on('error', (err) => {
       console.error('PMD socket error:', err);
+      this.emit('error', err);
     });
 
     this.socket.on('close', () => {
       console.log('PMD connection closed');
+      this.socket = undefined;
+      this.emit('disconnect');
     });
   }
 
@@ -239,9 +244,9 @@ export class PMDClient {
   }
 
   /**
-   * Register event handler
+   * Register event handler (for peer events)
    */
-  on(event: string, handler: (data: any) => void): void {
+  onPeerEvent(event: string, handler: (data: any) => void): void {
     if (!this.eventHandlers.has(event)) {
       this.eventHandlers.set(event, []);
     }
@@ -253,7 +258,7 @@ export class PMDClient {
    */
   disconnect(): void {
     if (this.socket) {
-      this.socket.end();
+      this.socket.destroy();
       this.socket = undefined;
     }
   }
